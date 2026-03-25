@@ -4,7 +4,7 @@ use std::process::Command;
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState};
 use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 // ANSI colors
 const GREEN: &str = "\x1b[32m";
@@ -19,9 +19,23 @@ const IDLE_SHELLS: &[&str] = &["zsh", "bash", "sh", "fish"];
 const AGENT_COMMANDS: &[&str] = &["claude", "codex", "codex-aarch64-apple-darwin"];
 
 fn is_spinner(c: char) -> bool {
-    matches!(c,
-        '⠂' | '⠒' | '⠑' | '⠊' | '✳' | '⣾' | '⣽' | '⣻' | '⢿' |
-        '⡿' | '⣟' | '⣯' | '⣷' | '⠈' | '⠐' | '⠠'
+    matches!(
+        c,
+        '⠂' | '⠒'
+            | '⠑'
+            | '⠊'
+            | '✳'
+            | '⣾'
+            | '⣽'
+            | '⣻'
+            | '⢿'
+            | '⡿'
+            | '⣟'
+            | '⣯'
+            | '⣷'
+            | '⠈'
+            | '⠐'
+            | '⠠'
     )
 }
 
@@ -61,6 +75,29 @@ struct ZellijPane {
 }
 
 // --- Helpers ---
+
+/// Terminal display width that accounts for VS16 (U+FE0F) making preceding
+/// text-presentation-default emoji render as 2-wide.
+fn display_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut prev_char_width = 0usize;
+    for c in s.chars() {
+        if c == '\u{FE0F}' {
+            // VS16 forces emoji presentation (2 columns).
+            // If unicode-width already counted the preceding char as 2, no-op;
+            // otherwise bump by the difference.
+            if prev_char_width < 2 {
+                width += 2 - prev_char_width;
+            }
+            prev_char_width = 0;
+            continue;
+        }
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        width += cw;
+        prev_char_width = cw;
+    }
+    width
+}
 
 fn base_name(cmd: &str) -> &str {
     let binary = cmd.split_whitespace().next().unwrap_or("");
@@ -281,22 +318,20 @@ fn main() {
                 continue;
             }
             s.task = extract_task(&pane.title).to_string();
-            s.agent_state = Some(
-                if let Some(pids) = agent_pid_map.get(&pane.cwd) {
-                    if pids.iter().any(|p| working_pids.contains(p)) {
-                        AgentState::Working
-                    } else {
-                        AgentState::Waiting
-                    }
+            s.agent_state = Some(if let Some(pids) = agent_pid_map.get(&pane.cwd) {
+                if pids.iter().any(|p| working_pids.contains(p)) {
+                    AgentState::Working
                 } else {
-                    // Fallback: title spinner
-                    if pane.title.starts_with(is_spinner) {
-                        AgentState::Working
-                    } else {
-                        AgentState::Waiting
-                    }
-                },
-            );
+                    AgentState::Waiting
+                }
+            } else {
+                // Fallback: title spinner
+                if pane.title.starts_with(is_spinner) {
+                    AgentState::Working
+                } else {
+                    AgentState::Waiting
+                }
+            });
             break;
         }
 
@@ -304,15 +339,25 @@ fn main() {
     }
 
     // Render
-    let max_name = sessions.iter().map(|s| s.name.len()).max().unwrap_or(7).max(7);
-    let cmd_texts: Vec<String> = sessions.iter().map(cmd_summary).collect();
-    let max_cmd = cmd_texts
+    let max_name = sessions
         .iter()
-        .map(|t| UnicodeWidthStr::width(t.as_str()))
+        .map(|s| s.name.len())
         .max()
         .unwrap_or(7)
         .max(7);
-    let max_age = sessions.iter().map(|s| s.age.len()).max().unwrap_or(3).max(3);
+    let cmd_texts: Vec<String> = sessions.iter().map(cmd_summary).collect();
+    let max_cmd = cmd_texts
+        .iter()
+        .map(|t| display_width(t))
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let max_age = sessions
+        .iter()
+        .map(|s| s.age.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
 
     println!(
         "  {:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK",
@@ -321,11 +366,14 @@ fn main() {
     println!("{}", "━".repeat(max_name + max_cmd + max_age + 12));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
-        let cmd_w = UnicodeWidthStr::width(cmd_text.as_str());
+        let cmd_w = display_width(cmd_text);
         let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
 
         let (dot, name_display) = if s.is_current {
-            (format!("{GREEN}●{RESET}"), format!("{BOLD}{}{RESET}", s.name))
+            (
+                format!("{GREEN}●{RESET}"),
+                format!("{BOLD}{}{RESET}", s.name),
+            )
         } else if s.is_exited {
             (format!("{DIM}✕{RESET}"), format!("{DIM}{}{RESET}", s.name))
         } else {
@@ -361,6 +409,8 @@ fn main() {
             }
         };
 
-        println!("{dot} {name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}");
+        println!(
+            "{dot} {name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
+        );
     }
 }
