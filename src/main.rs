@@ -9,7 +9,6 @@ use unicode_width::UnicodeWidthChar;
 
 // ANSI colors
 const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const BRIGHT_CYAN: &str = "\x1b[96m";
 const YELLOW: &str = "\x1b[33m";
@@ -404,24 +403,21 @@ fn main() {
         .max(3);
 
     println!(
-        "{DIM}  {:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
+        "{DIM}{:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
         "SESSION", "STATUS", "AGE"
     );
-    println!("{DIM}{}{RESET}", "━".repeat(max_name + max_cmd + max_age + 12));
+    println!("{DIM}{}{RESET}", "━".repeat(max_name + max_cmd + max_age + 10));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
         let cmd_w = display_width(cmd_text);
         let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
 
-        let (dot, name_display) = if s.is_current {
-            (
-                format!("{GREEN}●{RESET}"),
-                format!("{BOLD}{}{RESET}", s.name),
-            )
+        let name_display = if s.is_current {
+            format!("{GREEN}{BOLD}{}{RESET}", s.name)
         } else if s.is_exited {
-            (format!("{RED}✕{RESET}"), format!("{DIM}{}{RESET}", s.name))
+            format!("{DIM}{}{RESET}", s.name)
         } else {
-            (format!("{DIM}○{RESET}"), s.name.clone())
+            s.name.clone()
         };
         let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
@@ -454,7 +450,7 @@ fn main() {
         };
 
         println!(
-            "{dot} {name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
+            "{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
         );
     }
 }
