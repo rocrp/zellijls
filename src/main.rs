@@ -1,3 +1,5 @@
+mod pick;
+
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
@@ -8,13 +10,13 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use unicode_width::UnicodeWidthChar;
 
 // ANSI colors
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const BRIGHT_CYAN: &str = "\x1b[96m";
-const YELLOW: &str = "\x1b[33m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const CYAN: &str = "\x1b[36m";
+pub(crate) const BRIGHT_CYAN: &str = "\x1b[96m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
+pub(crate) const DIM: &str = "\x1b[2m";
+pub(crate) const RESET: &str = "\x1b[0m";
+pub(crate) const BOLD: &str = "\x1b[1m";
 
 const IDLE_SHELLS: &[&str] = &["zsh", "bash", "sh", "fish"];
 const AGENT_COMMANDS: &[&str] = &["claude", "codex", "codex-aarch64-apple-darwin"];
@@ -42,27 +44,27 @@ fn is_spinner(c: char) -> bool {
 // --- Data types ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentState {
+pub(crate) enum AgentState {
     Working,
     Waiting,
 }
 
 #[derive(Debug)]
-struct Pane {
-    command: String,
-    cwd: String,
-    title: String,
+pub(crate) struct Pane {
+    pub command: String,
+    pub cwd: String,
+    pub title: String,
 }
 
 #[derive(Debug)]
-struct Session {
-    name: String,
-    age: String,
-    is_current: bool,
-    is_exited: bool,
-    panes: Vec<Pane>,
-    agent_state: Option<AgentState>,
-    task: String,
+pub(crate) struct Session {
+    pub name: String,
+    pub age: String,
+    pub is_current: bool,
+    pub is_exited: bool,
+    pub panes: Vec<Pane>,
+    pub agent_state: Option<AgentState>,
+    pub task: String,
 }
 
 #[derive(Deserialize)]
@@ -78,14 +80,11 @@ struct ZellijPane {
 
 /// Terminal display width that accounts for VS16 (U+FE0F) making preceding
 /// text-presentation-default emoji render as 2-wide.
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     let mut width = 0;
     let mut prev_char_width = 0usize;
     for c in s.chars() {
         if c == '\u{FE0F}' {
-            // VS16 forces emoji presentation (2 columns).
-            // If unicode-width already counted the preceding char as 2, no-op;
-            // otherwise bump by the difference.
             if prev_char_width < 2 {
                 width += 2 - prev_char_width;
             }
@@ -99,7 +98,7 @@ fn display_width(s: &str) -> usize {
     width
 }
 
-fn base_name(cmd: &str) -> &str {
+pub(crate) fn base_name(cmd: &str) -> &str {
     let binary = cmd.split_whitespace().next().unwrap_or("");
     binary.rsplit('/').next().unwrap_or(binary)
 }
@@ -143,7 +142,6 @@ fn get_session_list() -> Vec<(String, String, bool, bool)> {
             let is_current = line.contains("(current)");
             let is_exited = line.contains("EXITED");
 
-            // Parse "Created 14h 18m 41s ago" -> "14h"
             let age = line
                 .find("Created ")
                 .and_then(|i| {
@@ -211,8 +209,6 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
 
     let mut working = HashSet::new();
 
-    // Signal 1: CPU usage > threshold → definitely working
-    // (streaming API response, processing files, etc.)
     for &pid in &all_pids {
         if let Some(process) = sys.process(Pid::from_u32(pid))
             && process.cpu_usage() > 3.0
@@ -221,8 +217,6 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
         }
     }
 
-    // Signal 2: TCP connections, but only if process also has some CPU activity.
-    // Filters out HTTP/2 keep-alive connections that stay ESTABLISHED when idle.
     let af = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
     let proto = ProtocolFlags::TCP;
     if let Ok(sockets) = netstat2::get_sockets_info(af, proto) {
@@ -246,59 +240,14 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
     working
 }
 
-// --- Display ---
+// --- Session building ---
 
-fn cmd_summary(session: &Session) -> String {
-    if session.is_exited {
-        return "exited".into();
-    }
-
-    let mut commands = Vec::new();
-    let mut shell_count = 0u32;
-
-    for pane in &session.panes {
-        if pane.command.is_empty() {
-            continue;
-        }
-        if is_shell(&pane.command) {
-            shell_count += 1;
-            continue;
-        }
-        let base = base_name(&pane.command);
-        if is_agent(&pane.command) {
-            let ind = match session.agent_state {
-                Some(AgentState::Working) => "🏗️",
-                _ => "💤",
-            };
-            commands.push(format!("{base} {ind}"));
-        } else {
-            commands.push(base.to_string());
-        }
-    }
-
-    if commands.is_empty() {
-        return if shell_count > 0 {
-            "idle".into()
-        } else {
-            "empty".into()
-        };
-    }
-
-    let mut result = commands.join(" + ");
-    if shell_count > 0 {
-        result.push_str(&format!(" +{shell_count}sh"));
-    }
-    result
-}
-
-fn main() {
+fn build_sessions() -> Vec<Session> {
     let meta = get_session_list();
     if meta.is_empty() {
-        println!("No zellij sessions.");
-        return;
+        return vec![];
     }
 
-    // First CPU sample (need two samples for accurate CPU measurement)
     let cpu_sample_start = Instant::now();
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -331,7 +280,6 @@ fn main() {
 
         s.panes = get_panes(name);
 
-        // Extract task name (defer state determination until after second CPU sample)
         for pane in &s.panes {
             if is_agent(&pane.command) {
                 s.task = extract_task(&pane.title).to_string();
@@ -349,14 +297,12 @@ fn main() {
         std::thread::sleep(min_delay - elapsed);
     }
 
-    // Second CPU sample — now cpu_usage() returns meaningful values
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing().with_cpu(),
     );
 
-    // Multi-signal working detection: CPU + TCP (gated by CPU activity)
     let working_pids = build_working_pids(&sys, &agent_pid_map);
 
     // Determine agent state — spinner (Claude's own UI signal) takes priority
@@ -366,7 +312,6 @@ fn main() {
                 continue;
             }
             s.agent_state = Some(if pane.title.starts_with(is_spinner) {
-                // Spinner in pane title = Claude says it's working
                 AgentState::Working
             } else if let Some(pids) = agent_pid_map.get(&pane.cwd) {
                 if pids.iter().any(|p| working_pids.contains(p)) {
@@ -381,7 +326,55 @@ fn main() {
         }
     }
 
-    // Render
+    sessions
+}
+
+// --- Display ---
+
+pub(crate) fn cmd_summary(session: &Session) -> String {
+    if session.is_exited {
+        return "exited".into();
+    }
+
+    let mut commands = Vec::new();
+    let mut shell_count = 0u32;
+
+    for pane in &session.panes {
+        if pane.command.is_empty() {
+            continue;
+        }
+        if is_shell(&pane.command) {
+            shell_count += 1;
+            continue;
+        }
+        let base = base_name(&pane.command);
+        if is_agent(&pane.command) {
+            let ind = match session.agent_state {
+                Some(AgentState::Working) => "\u{1f3d7}\u{fe0f}",
+                _ => "\u{1f4a4}",
+            };
+            commands.push(format!("{base} {ind}"));
+        } else {
+            commands.push(base.to_string());
+        }
+    }
+
+    if commands.is_empty() {
+        return if shell_count > 0 {
+            "idle".into()
+        } else {
+            "empty".into()
+        };
+    }
+
+    let mut result = commands.join(" + ");
+    if shell_count > 0 {
+        result.push_str(&format!(" +{shell_count}sh"));
+    }
+    result
+}
+
+fn print_table(sessions: &[Session]) {
     let max_name = sessions
         .iter()
         .map(|s| s.name.len())
@@ -406,7 +399,7 @@ fn main() {
         "{DIM}{:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
         "SESSION", "STATUS", "AGE"
     );
-    println!("{DIM}{}{RESET}", "━".repeat(max_name + max_cmd + max_age + 10));
+    println!("{DIM}{}{RESET}", "\u{2501}".repeat(max_name + max_cmd + max_age + 10));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
         let cmd_w = display_width(cmd_text);
@@ -438,7 +431,7 @@ fn main() {
             String::new()
         } else {
             let task = if s.task.len() > 50 {
-                format!("{}…", &s.task[..49])
+                format!("{}\u{2026}", &s.task[..49])
             } else {
                 s.task.clone()
             };
@@ -452,5 +445,39 @@ fn main() {
         println!(
             "{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
         );
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let subcmd = args.get(1).map(|s| s.as_str());
+
+    let sessions = build_sessions();
+
+    match subcmd {
+        Some("pick" | "-i") => {
+            if sessions.is_empty() {
+                // No sessions — launch a fresh zellij
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new("zellij").exec();
+                eprintln!("Failed to launch zellij: {err}");
+                std::process::exit(1);
+            }
+            if let Some(name) = pick::run(&sessions) {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new("zellij")
+                    .args(["attach", &name])
+                    .exec();
+                eprintln!("Failed to attach: {err}");
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            if sessions.is_empty() {
+                println!("No zellij sessions.");
+                return;
+            }
+            print_table(&sessions);
+        }
     }
 }
