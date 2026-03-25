@@ -11,25 +11,14 @@ use crate::{
 };
 
 pub fn run(sessions: &[Session]) -> Option<String> {
-    let active: Vec<(usize, &Session)> = sessions
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !s.is_exited)
-        .collect();
-
-    if active.is_empty() {
-        eprintln!("No active sessions.");
-        return None;
-    }
-
     // Pre-compute display strings
     let cmd_texts: Vec<String> = sessions.iter().map(cmd_summary).collect();
 
     // Column widths for alignment
-    let max_name = active.iter().map(|(_, s)| s.name.len()).max().unwrap_or(0);
-    let max_cmd = active
+    let max_name = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
+    let max_cmd = cmd_texts
         .iter()
-        .map(|(i, _)| display_width(&cmd_texts[*i]))
+        .map(|t| display_width(t))
         .max()
         .unwrap_or(0);
 
@@ -56,8 +45,8 @@ pub fn run(sessions: &[Session]) -> Option<String> {
         .ok();
 
         // Session list
-        for (list_idx, &(sess_idx, s)) in active.iter().enumerate() {
-            let cmd = &cmd_texts[sess_idx];
+        for (list_idx, s) in sessions.iter().enumerate() {
+            let cmd = &cmd_texts[list_idx];
             let cmd_w = display_width(cmd);
             let is_sel = list_idx == sel;
 
@@ -67,15 +56,18 @@ pub fn run(sessions: &[Session]) -> Option<String> {
                 " ".into()
             };
 
-            let name = if is_sel {
+            let name = if s.is_exited {
+                format!("{DIM}{}{RESET}", s.name)
+            } else if is_sel {
                 format!("{BOLD}{}{RESET}", s.name)
             } else {
                 s.name.clone()
             };
             let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
-            let cmd_display = if is_sel {
-                // Color by agent state
+            let cmd_display = if s.is_exited {
+                format!("{DIM}{cmd}{RESET}")
+            } else if is_sel {
                 match s.agent_state {
                     Some(AgentState::Working) => format!("{BRIGHT_CYAN}{cmd}{RESET}"),
                     Some(AgentState::Waiting) => format!("{YELLOW}{cmd}{RESET}"),
@@ -100,7 +92,7 @@ pub fn run(sessions: &[Session]) -> Option<String> {
         }
 
         // Detail section for selected session
-        let sel_sess = active[sel].1;
+        let sel_sess = &sessions[sel];
         write!(stdout, "\r\n {DIM}\u{2500}\u{2500}\u{2500}{RESET}\r\n").ok();
 
         if !sel_sess.task.is_empty() {
@@ -146,12 +138,12 @@ pub fn run(sessions: &[Session]) -> Option<String> {
                     sel = sel.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if sel + 1 < active.len() {
+                    if sel + 1 < sessions.len() {
                         sel += 1;
                     }
                 }
                 KeyCode::Enter => {
-                    result = Some(active[sel].1.name.clone());
+                    result = Some(sessions[sel].name.clone());
                     break;
                 }
                 _ => {}
