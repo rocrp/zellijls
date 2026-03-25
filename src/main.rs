@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthChar;
 
 // ANSI colors
 const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const BRIGHT_CYAN: &str = "\x1b[96m";
 const YELLOW: &str = "\x1b[33m";
@@ -250,7 +251,7 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
 
 fn cmd_summary(session: &Session) -> String {
     if session.is_exited {
-        return "(exited)".into();
+        return "exited".into();
     }
 
     let mut commands = Vec::new();
@@ -268,7 +269,7 @@ fn cmd_summary(session: &Session) -> String {
         if is_agent(&pane.command) {
             let ind = match session.agent_state {
                 Some(AgentState::Working) => "🏗️",
-                _ => "⏳",
+                _ => "💤",
             };
             commands.push(format!("{base} {ind}"));
         } else {
@@ -278,15 +279,15 @@ fn cmd_summary(session: &Session) -> String {
 
     if commands.is_empty() {
         return if shell_count > 0 {
-            "(idle)".into()
+            "idle".into()
         } else {
-            "(empty)".into()
+            "empty".into()
         };
     }
 
     let mut result = commands.join(" + ");
     if shell_count > 0 {
-        result.push_str(&format!(" +{shell_count}"));
+        result.push_str(&format!(" +{shell_count}sh"));
     }
     result
 }
@@ -403,10 +404,10 @@ fn main() {
         .max(3);
 
     println!(
-        "  {:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK",
-        "SESSION", "COMMAND", "AGE"
+        "{DIM}  {:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
+        "SESSION", "STATUS", "AGE"
     );
-    println!("{}", "━".repeat(max_name + max_cmd + max_age + 12));
+    println!("{DIM}{}{RESET}", "━".repeat(max_name + max_cmd + max_age + 12));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
         let cmd_w = display_width(cmd_text);
@@ -418,14 +419,14 @@ fn main() {
                 format!("{BOLD}{}{RESET}", s.name),
             )
         } else if s.is_exited {
-            (format!("{DIM}✕{RESET}"), format!("{DIM}{}{RESET}", s.name))
+            (format!("{RED}✕{RESET}"), format!("{DIM}{}{RESET}", s.name))
         } else {
             (format!("{DIM}○{RESET}"), s.name.clone())
         };
         let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
         let cmd_display = match cmd_text.as_str() {
-            "(idle)" | "(empty)" | "(exited)" => format!("{DIM}{cmd_text}{RESET}"),
+            "idle" | "empty" | "exited" => format!("{DIM}{cmd_text}{RESET}"),
             _ if s.agent_state == Some(AgentState::Working) => {
                 format!("{BRIGHT_CYAN}{cmd_text}{RESET}")
             }
