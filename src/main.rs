@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::time::Instant;
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState};
 use serde::Deserialize;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use unicode_width::UnicodeWidthChar;
 
 // ANSI colors
@@ -24,7 +25,6 @@ fn is_spinner(c: char) -> bool {
         '⠂' | '⠒'
             | '⠑'
             | '⠊'
-            | '✳'
             | '⣾'
             | '⣽'
             | '⣻'
@@ -114,7 +114,7 @@ fn is_agent(cmd: &str) -> bool {
 }
 
 fn extract_task(title: &str) -> &str {
-    let t = title.trim_start_matches(|c: char| is_spinner(c) || c == ' ');
+    let t = title.trim_start_matches(|c: char| is_spinner(c) || c == '✳' || c == ' ');
     t.trim_start()
 }
 
@@ -203,16 +203,28 @@ fn build_agent_pid_map(sys: &System) -> HashMap<String, Vec<u32>> {
     map
 }
 
-fn build_working_pids(agent_pids: &HashMap<String, Vec<u32>>) -> HashSet<u32> {
+fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> HashSet<u32> {
     let all_pids: HashSet<u32> = agent_pids.values().flatten().copied().collect();
     if all_pids.is_empty() {
         return HashSet::new();
     }
 
     let mut working = HashSet::new();
+
+    // Signal 1: CPU usage > threshold → definitely working
+    // (streaming API response, processing files, etc.)
+    for &pid in &all_pids {
+        if let Some(process) = sys.process(Pid::from_u32(pid))
+            && process.cpu_usage() > 3.0
+        {
+            working.insert(pid);
+        }
+    }
+
+    // Signal 2: TCP connections, but only if process also has some CPU activity.
+    // Filters out HTTP/2 keep-alive connections that stay ESTABLISHED when idle.
     let af = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
     let proto = ProtocolFlags::TCP;
-
     if let Ok(sockets) = netstat2::get_sockets_info(af, proto) {
         for si in sockets {
             if let ProtocolSocketInfo::Tcp(ref tcp) = si.protocol_socket_info {
@@ -220,7 +232,11 @@ fn build_working_pids(agent_pids: &HashMap<String, Vec<u32>>) -> HashSet<u32> {
                     continue;
                 }
                 for &pid in &si.associated_pids {
-                    if all_pids.contains(&pid) {
+                    if all_pids.contains(&pid)
+                        && !working.contains(&pid)
+                        && let Some(process) = sys.process(Pid::from_u32(pid))
+                        && process.cpu_usage() > 0.5
+                    {
                         working.insert(pid);
                     }
                 }
@@ -282,18 +298,20 @@ fn main() {
         return;
     }
 
-    // Process info: single in-process call replaces N subprocess lsof calls
+    // First CPU sample (need two samples for accurate CPU measurement)
+    let cpu_sample_start = Instant::now();
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .with_cpu(),
     );
     let agent_pid_map = build_agent_pid_map(&sys);
-    // TCP check: single call replaces N subprocess lsof calls
-    let working_pids = build_working_pids(&agent_pid_map);
 
-    // Pane queries must be sequential (zellij race condition drops fields)
+    // Pane queries must be sequential (zellij race condition drops fields).
+    // This also serves as natural delay between CPU samples.
     let mut sessions: Vec<Session> = Vec::with_capacity(meta.len());
     for (name, age, is_current, is_exited) in &meta {
         let mut s = Session {
@@ -313,29 +331,54 @@ fn main() {
 
         s.panes = get_panes(name);
 
+        // Extract task name (defer state determination until after second CPU sample)
+        for pane in &s.panes {
+            if is_agent(&pane.command) {
+                s.task = extract_task(&pane.title).to_string();
+                break;
+            }
+        }
+
+        sessions.push(s);
+    }
+
+    // Ensure minimum 200ms between CPU samples for accuracy
+    let min_delay = std::time::Duration::from_millis(200);
+    let elapsed = cpu_sample_start.elapsed();
+    if elapsed < min_delay {
+        std::thread::sleep(min_delay - elapsed);
+    }
+
+    // Second CPU sample — now cpu_usage() returns meaningful values
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cpu(),
+    );
+
+    // Multi-signal working detection: CPU + TCP (gated by CPU activity)
+    let working_pids = build_working_pids(&sys, &agent_pid_map);
+
+    // Determine agent state — spinner (Claude's own UI signal) takes priority
+    for s in &mut sessions {
         for pane in &s.panes {
             if !is_agent(&pane.command) {
                 continue;
             }
-            s.task = extract_task(&pane.title).to_string();
-            s.agent_state = Some(if let Some(pids) = agent_pid_map.get(&pane.cwd) {
+            s.agent_state = Some(if pane.title.starts_with(is_spinner) {
+                // Spinner in pane title = Claude says it's working
+                AgentState::Working
+            } else if let Some(pids) = agent_pid_map.get(&pane.cwd) {
                 if pids.iter().any(|p| working_pids.contains(p)) {
                     AgentState::Working
                 } else {
                     AgentState::Waiting
                 }
             } else {
-                // Fallback: title spinner
-                if pane.title.starts_with(is_spinner) {
-                    AgentState::Working
-                } else {
-                    AgentState::Waiting
-                }
+                AgentState::Waiting
             });
             break;
         }
-
-        sessions.push(s);
     }
 
     // Render
