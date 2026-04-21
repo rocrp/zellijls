@@ -1,7 +1,9 @@
 mod age;
 mod pick;
+mod session_info;
 
-use age::{AgeTier, age_tier, freshest_age_seconds, parse_age_seconds, sort_sessions_for_display};
+use age::{AgeTier, age_tier, freshest_age_seconds, sort_sessions_for_display};
+use session_info::session_age;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
@@ -176,20 +178,19 @@ fn get_session_list() -> Vec<SessionMeta> {
                 .to_string();
             let is_current = line.contains("(current)");
             let is_exited = line.contains("EXITED");
-            let age = line
+            let created_age = line
                 .find("[Created ")
                 .and_then(|i| {
                     let rest = &line[i + 9..];
                     rest.find(" ago]").map(|end| rest[..end].to_string())
                 })
                 .unwrap_or_else(|| panic!("missing age in `zellij ls` output: {line}"));
-            let age_seconds = parse_age_seconds(&age)
-                .unwrap_or_else(|| panic!("unsupported zellij age format: {age}"));
+            let age = session_age(&name, &created_age);
 
             SessionMeta {
                 name,
-                age,
-                age_seconds,
+                age: age.label,
+                age_seconds: age.seconds,
                 is_current,
                 is_exited,
             }
