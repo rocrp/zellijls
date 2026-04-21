@@ -6,19 +6,26 @@ use crossterm::execute;
 use crossterm::terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::{
-    base_name, cmd_summary, display_width, AgentState, Session, BOLD, BRIGHT_CYAN, DIM, GREEN,
-    RESET, YELLOW,
+    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, RESET, Session, YELLOW,
+    age::{AgeTier, age_tier, freshest_age_seconds},
+    base_name, cmd_summary, display_width, paint, status_color,
 };
 
 pub fn run(sessions: &[Session]) -> Option<String> {
     // Pre-compute display strings
     let cmd_texts: Vec<String> = sessions.iter().map(cmd_summary).collect();
+    let freshest_age = freshest_age_seconds(sessions);
 
     // Column widths for alignment
     let max_name = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
     let max_cmd = cmd_texts
         .iter()
         .map(|t| display_width(t))
+        .max()
+        .unwrap_or(0);
+    let max_age = sessions
+        .iter()
+        .map(|s| display_width(&s.age))
         .max()
         .unwrap_or(0);
 
@@ -46,42 +53,68 @@ pub fn run(sessions: &[Session]) -> Option<String> {
 
         // Session list
         for (list_idx, s) in sessions.iter().enumerate() {
+            let tier = age_tier(s, freshest_age);
             let cmd = &cmd_texts[list_idx];
             let cmd_w = display_width(cmd);
             let is_sel = list_idx == sel;
 
             let marker = if is_sel {
-                format!("{GREEN}\u{25b8}{RESET}")
+                paint("\u{25b8}", &[GREEN])
+            } else if matches!(tier, AgeTier::Freshest) {
+                paint("\u{2022}", &[BRIGHT_CYAN])
             } else {
                 " ".into()
             };
 
-            let name = if s.is_exited {
-                format!("{DIM}{}{RESET}", s.name)
-            } else if is_sel {
-                format!("{BOLD}{}{RESET}", s.name)
+            let mut name_styles = Vec::new();
+            if s.is_exited {
+                name_styles.push(DIM);
             } else {
-                s.name.clone()
-            };
+                if is_sel {
+                    name_styles.push(BOLD);
+                }
+                if s.is_current {
+                    name_styles.push(GREEN);
+                } else if !is_sel {
+                    match tier {
+                        AgeTier::Freshest => name_styles.push(BRIGHT_CYAN),
+                        AgeTier::Recent => {}
+                        AgeTier::Stale => name_styles.push(DIM),
+                        AgeTier::Old | AgeTier::Exited => name_styles.push(BRIGHT_BLACK),
+                    }
+                } else if matches!(tier, AgeTier::Freshest) {
+                    name_styles.push(BRIGHT_CYAN);
+                }
+            }
+            let name = paint(&s.name, &name_styles);
             let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
-            let cmd_display = if s.is_exited {
-                format!("{DIM}{cmd}{RESET}")
-            } else if is_sel {
-                match s.agent_state {
-                    Some(AgentState::Working) => format!("{BRIGHT_CYAN}{cmd}{RESET}"),
-                    Some(AgentState::Waiting) => format!("{YELLOW}{cmd}{RESET}"),
-                    None => cmd.clone(),
+            let mut cmd_styles = Vec::new();
+            if is_sel || matches!(tier, AgeTier::Freshest) {
+                cmd_styles.push(BOLD);
+            } else if matches!(tier, AgeTier::Stale) {
+                cmd_styles.push(DIM);
+            } else if matches!(tier, AgeTier::Old | AgeTier::Exited) {
+                cmd_styles.push(BRIGHT_BLACK);
+            }
+            if !matches!(tier, AgeTier::Old | AgeTier::Exited) {
+                if let Some(color) = status_color(s) {
+                    cmd_styles.push(color);
                 }
-            } else {
-                format!("{DIM}{cmd}{RESET}")
-            };
+            }
+            let cmd_display = paint(cmd, &cmd_styles);
             let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
 
             let age = if s.age.is_empty() {
                 String::new()
             } else {
-                format!("{DIM}{}{RESET}", s.age)
+                let age_text = format!("{:>max_age$}", s.age);
+                match tier {
+                    AgeTier::Freshest => paint(&age_text, &[GREEN, BOLD]),
+                    AgeTier::Recent => paint(&age_text, &[GREEN]),
+                    AgeTier::Stale => paint(&age_text, &[DIM]),
+                    AgeTier::Old | AgeTier::Exited => paint(&age_text, &[BRIGHT_BLACK]),
+                }
             };
 
             write!(
@@ -101,12 +134,7 @@ pub fn run(sessions: &[Session]) -> Option<String> {
                 Some(AgentState::Waiting) => format!(" {YELLOW}waiting{RESET}"),
                 None => String::new(),
             };
-            write!(
-                stdout,
-                " {DIM}task:{RESET} {}{state}\r\n",
-                sel_sess.task
-            )
-            .ok();
+            write!(stdout, " {DIM}task:{RESET} {}{state}\r\n", sel_sess.task).ok();
         }
 
         for pane in &sel_sess.panes {
@@ -115,11 +143,7 @@ pub fn run(sessions: &[Session]) -> Option<String> {
             }
             let base = base_name(&pane.command);
             let cwd = pane.cwd.rsplit('/').next().unwrap_or(&pane.cwd);
-            write!(
-                stdout,
-                " {DIM}pane:{RESET} {base} {DIM}@ {cwd}{RESET}\r\n"
-            )
-            .ok();
+            write!(stdout, " {DIM}pane:{RESET} {base} {DIM}@ {cwd}{RESET}\r\n").ok();
         }
 
         stdout.flush().ok();

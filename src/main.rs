@@ -1,5 +1,7 @@
+mod age;
 mod pick;
 
+use age::{AgeTier, age_tier, freshest_age_seconds, parse_age_seconds, sort_sessions_for_display};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
@@ -13,6 +15,7 @@ use unicode_width::UnicodeWidthChar;
 pub(crate) const GREEN: &str = "\x1b[32m";
 pub(crate) const CYAN: &str = "\x1b[36m";
 pub(crate) const BRIGHT_CYAN: &str = "\x1b[96m";
+pub(crate) const BRIGHT_BLACK: &str = "\x1b[90m";
 pub(crate) const YELLOW: &str = "\x1b[33m";
 pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -60,11 +63,21 @@ pub(crate) struct Pane {
 pub(crate) struct Session {
     pub name: String,
     pub age: String,
+    pub age_seconds: u64,
     pub is_current: bool,
     pub is_exited: bool,
     pub panes: Vec<Pane>,
     pub agent_state: Option<AgentState>,
     pub task: String,
+}
+
+#[derive(Debug)]
+struct SessionMeta {
+    name: String,
+    age: String,
+    age_seconds: u64,
+    is_current: bool,
+    is_exited: bool,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +116,26 @@ pub(crate) fn base_name(cmd: &str) -> &str {
     binary.rsplit('/').next().unwrap_or(binary)
 }
 
+pub(crate) fn paint(text: &str, styles: &[&str]) -> String {
+    if styles.is_empty() {
+        return text.to_string();
+    }
+
+    format!("{}{}{RESET}", styles.concat(), text)
+}
+
+pub(crate) fn status_color(session: &Session) -> Option<&'static str> {
+    if session.is_exited {
+        return None;
+    }
+
+    Some(match session.agent_state {
+        Some(AgentState::Working) => BRIGHT_CYAN,
+        Some(AgentState::Waiting) => YELLOW,
+        None => CYAN,
+    })
+}
+
 fn is_shell(cmd: &str) -> bool {
     IDLE_SHELLS.contains(&base_name(cmd))
 }
@@ -128,35 +161,38 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
 
 // --- Zellij queries ---
 
-fn get_session_list() -> Vec<(String, String, bool, bool)> {
+fn get_session_list() -> Vec<SessionMeta> {
     let Some(out) = run_cmd("zellij", &["ls", "--no-formatting"]) else {
         return vec![];
     };
     out.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let name = line.split_whitespace().next()?.to_string();
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let name = line
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("missing session name in `zellij ls` output: {line}"))
+                .to_string();
             let is_current = line.contains("(current)");
             let is_exited = line.contains("EXITED");
-
             let age = line
-                .find("Created ")
+                .find("[Created ")
                 .and_then(|i| {
-                    let rest = &line[i + 8..];
-                    rest.find(" ago").map(|end| {
-                        rest[..end]
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .to_string()
-                    })
+                    let rest = &line[i + 9..];
+                    rest.find(" ago]").map(|end| rest[..end].to_string())
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| panic!("missing age in `zellij ls` output: {line}"));
+            let age_seconds = parse_age_seconds(&age)
+                .unwrap_or_else(|| panic!("unsupported zellij age format: {age}"));
 
-            Some((name, age, is_current, is_exited))
+            SessionMeta {
+                name,
+                age,
+                age_seconds,
+                is_current,
+                is_exited,
+            }
         })
         .collect()
 }
@@ -262,23 +298,24 @@ fn build_sessions() -> Vec<Session> {
     // Pane queries must be sequential (zellij race condition drops fields).
     // This also serves as natural delay between CPU samples.
     let mut sessions: Vec<Session> = Vec::with_capacity(meta.len());
-    for (name, age, is_current, is_exited) in &meta {
+    for session_meta in &meta {
         let mut s = Session {
-            name: name.clone(),
-            age: age.clone(),
-            is_current: *is_current,
-            is_exited: *is_exited,
+            name: session_meta.name.clone(),
+            age: session_meta.age.clone(),
+            age_seconds: session_meta.age_seconds,
+            is_current: session_meta.is_current,
+            is_exited: session_meta.is_exited,
             panes: vec![],
             agent_state: None,
             task: String::new(),
         };
 
-        if *is_exited {
+        if session_meta.is_exited {
             sessions.push(s);
             continue;
         }
 
-        s.panes = get_panes(name);
+        s.panes = get_panes(&session_meta.name);
 
         for pane in &s.panes {
             if is_agent(&pane.command) {
@@ -326,6 +363,7 @@ fn build_sessions() -> Vec<Session> {
         }
     }
 
+    sort_sessions_for_display(&mut sessions);
     sessions
 }
 
@@ -375,6 +413,7 @@ pub(crate) fn cmd_summary(session: &Session) -> String {
 }
 
 fn print_table(sessions: &[Session]) {
+    let freshest_age = freshest_age_seconds(sessions);
     let max_name = sessions
         .iter()
         .map(|s| s.name.len())
@@ -390,7 +429,7 @@ fn print_table(sessions: &[Session]) {
         .max(7);
     let max_age = sessions
         .iter()
-        .map(|s| s.age.len())
+        .map(|s| display_width(&s.age))
         .max()
         .unwrap_or(3)
         .max(3);
@@ -399,33 +438,52 @@ fn print_table(sessions: &[Session]) {
         "{DIM}{:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
         "SESSION", "STATUS", "AGE"
     );
-    println!("{DIM}{}{RESET}", "\u{2501}".repeat(max_name + max_cmd + max_age + 10));
+    println!(
+        "{DIM}{}{RESET}",
+        "\u{2501}".repeat(max_name + max_cmd + max_age + 10)
+    );
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
+        let tier = age_tier(s, freshest_age);
         let cmd_w = display_width(cmd_text);
         let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
 
-        let name_display = if s.is_current {
-            format!("{GREEN}{BOLD}{}{RESET}", s.name)
-        } else if s.is_exited {
-            format!("{DIM}{}{RESET}", s.name)
+        let mut name_styles = Vec::new();
+        if s.is_current {
+            name_styles.extend([GREEN, BOLD]);
         } else {
-            s.name.clone()
-        };
+            match tier {
+                AgeTier::Freshest => name_styles.extend([BRIGHT_CYAN, BOLD]),
+                AgeTier::Recent => {}
+                AgeTier::Stale => name_styles.push(DIM),
+                AgeTier::Old | AgeTier::Exited => name_styles.push(BRIGHT_BLACK),
+            }
+        }
+        let name_display = paint(&s.name, &name_styles);
         let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
-        let cmd_display = match cmd_text.as_str() {
-            "idle" | "empty" | "exited" => format!("{DIM}{cmd_text}{RESET}"),
-            _ if s.agent_state == Some(AgentState::Working) => {
-                format!("{BRIGHT_CYAN}{cmd_text}{RESET}")
+        let mut cmd_styles = Vec::new();
+        if matches!(tier, AgeTier::Freshest) {
+            cmd_styles.push(BOLD);
+        } else if matches!(tier, AgeTier::Stale) {
+            cmd_styles.push(DIM);
+        } else if matches!(tier, AgeTier::Old | AgeTier::Exited) {
+            cmd_styles.push(DIM);
+        }
+        if !matches!(tier, AgeTier::Old | AgeTier::Exited) {
+            if let Some(color) = status_color(s) {
+                cmd_styles.push(color);
             }
-            _ if s.agent_state == Some(AgentState::Waiting) => {
-                format!("{YELLOW}{cmd_text}{RESET}")
-            }
-            _ => format!("{CYAN}{cmd_text}{RESET}"),
-        };
+        }
+        let cmd_display = paint(cmd_text, &cmd_styles);
 
-        let age_display = format!("{DIM}{:>max_age$}{RESET}", s.age);
+        let age_text = format!("{:>max_age$}", s.age);
+        let age_display = match tier {
+            AgeTier::Freshest => paint(&age_text, &[GREEN, BOLD]),
+            AgeTier::Recent => paint(&age_text, &[GREEN]),
+            AgeTier::Stale => paint(&age_text, &[DIM]),
+            AgeTier::Old | AgeTier::Exited => paint(&age_text, &[BRIGHT_BLACK]),
+        };
 
         let task_display = if s.task.is_empty() {
             String::new()
@@ -435,16 +493,16 @@ fn print_table(sessions: &[Session]) {
             } else {
                 s.task.clone()
             };
-            if s.agent_state == Some(AgentState::Waiting) {
-                format!("{DIM}{task}{RESET}")
+            if matches!(tier, AgeTier::Old | AgeTier::Exited) {
+                paint(&task, &[BRIGHT_BLACK])
+            } else if s.agent_state == Some(AgentState::Waiting) || matches!(tier, AgeTier::Stale) {
+                paint(&task, &[DIM])
             } else {
                 task
             }
         };
 
-        println!(
-            "{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
-        );
+        println!("{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}");
     }
 }
 
