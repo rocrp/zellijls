@@ -17,6 +17,7 @@ hntui    exited          4h
 - **Agent detection**: finds `claude`/`codex` processes, shows 🏗️ (working) or 💤 (waiting)
 - **Working/waiting**: checks TCP connections via `netstat2` — active API call = working, no connection = waiting
 - **Task extraction**: reads pane title set by Claude Code (spinner prefix stripped)
+- **Attached sessions**: session name is underlined when a client is currently attached (read from zellij's `session-metadata.kdl`)
 - **Fast**: process inspection via `sysinfo` + `netstat2` (no `lsof`/`ps` subprocess calls)
 
 ## Install

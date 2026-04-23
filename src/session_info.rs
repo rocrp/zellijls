@@ -17,6 +17,25 @@ pub(crate) fn session_age(session_name: &str, created_age: &str) -> SessionAge {
     updated_session_age(session_name).unwrap_or_else(|| created_session_age(created_age))
 }
 
+pub(crate) fn connected_clients(session_name: &str) -> u32 {
+    let Some(dir) = session_info_dir(session_name) else {
+        return 0;
+    };
+    let Ok(text) = fs::read_to_string(dir.join("session-metadata.kdl")) else {
+        return 0;
+    };
+    parse_connected_clients(&text)
+}
+
+fn parse_connected_clients(text: &str) -> u32 {
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("connected_clients ") {
+            return rest.trim().parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
 fn updated_session_age(session_name: &str) -> Option<SessionAge> {
     let session_info_dir = session_info_dir(session_name)?;
     let modified = fs::metadata(session_info_dir).ok()?.modified().ok()?;
@@ -126,7 +145,7 @@ impl SessionAge {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionAge, parse_cache_dir};
+    use super::{parse_cache_dir, parse_connected_clients, SessionAge};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -144,6 +163,25 @@ mod tests {
                 "/Users/test/Library/Caches/org.Zellij-Contributors.Zellij"
             ))
         );
+    }
+
+    #[test]
+    fn parses_connected_clients_from_metadata() {
+        let attached = r#"name "aimd"
+tabs {
+    tab {
+        position 0
+        other_focused_clients 2
+    }
+}
+connected_clients 1
+"#;
+        assert_eq!(parse_connected_clients(attached), 1);
+
+        let detached = "name \"x\"\nconnected_clients 0\n";
+        assert_eq!(parse_connected_clients(detached), 0);
+
+        assert_eq!(parse_connected_clients("name \"x\"\n"), 0);
     }
 
     #[test]

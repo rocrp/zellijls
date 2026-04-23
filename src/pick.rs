@@ -6,7 +6,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::{
-    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, RESET, Session, YELLOW,
+    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, RESET, Session, UNDERLINE, YELLOW,
     age::{AgeTier, age_tier, freshest_age_seconds},
     base_name, cmd_summary, display_width, paint, status_color,
 };
@@ -84,6 +84,9 @@ pub fn run(sessions: &[Session]) -> Option<String> {
                     }
                 } else if matches!(tier, AgeTier::Freshest) {
                     name_styles.push(BRIGHT_CYAN);
+                }
+                if s.connected_clients > 0 {
+                    name_styles.push(UNDERLINE);
                 }
             }
             let name = paint(&s.name, &name_styles);

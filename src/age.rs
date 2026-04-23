@@ -98,8 +98,8 @@ pub(crate) fn sort_sessions_for_display(sessions: &mut [Session]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgeTier, age_tier, format_age, freshest_age_seconds, parse_age_seconds,
-        sort_sessions_for_display,
+        age_tier, format_age, freshest_age_seconds, parse_age_seconds, sort_sessions_for_display,
+        AgeTier,
     };
     use crate::{Pane, Session};
 
@@ -110,6 +110,7 @@ mod tests {
             age_seconds,
             is_current,
             is_exited,
+            connected_clients: 0,
             panes: Vec::<Pane>::new(),
             agent_state: None,
             task: String::new(),

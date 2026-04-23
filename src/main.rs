@@ -3,7 +3,7 @@ mod pick;
 mod session_info;
 
 use age::{AgeTier, age_tier, freshest_age_seconds, sort_sessions_for_display};
-use session_info::session_age;
+use session_info::{connected_clients, session_age};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
@@ -22,6 +22,7 @@ pub(crate) const YELLOW: &str = "\x1b[33m";
 pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const BOLD: &str = "\x1b[1m";
+pub(crate) const UNDERLINE: &str = "\x1b[4m";
 
 const IDLE_SHELLS: &[&str] = &["zsh", "bash", "sh", "fish"];
 const AGENT_COMMANDS: &[&str] = &["claude", "codex", "codex-aarch64-apple-darwin"];
@@ -68,6 +69,7 @@ pub(crate) struct Session {
     pub age_seconds: u64,
     pub is_current: bool,
     pub is_exited: bool,
+    pub connected_clients: u32,
     pub panes: Vec<Pane>,
     pub agent_state: Option<AgentState>,
     pub task: String,
@@ -306,6 +308,7 @@ fn build_sessions() -> Vec<Session> {
             age_seconds: session_meta.age_seconds,
             is_current: session_meta.is_current,
             is_exited: session_meta.is_exited,
+            connected_clients: 0,
             panes: vec![],
             agent_state: None,
             task: String::new(),
@@ -315,6 +318,8 @@ fn build_sessions() -> Vec<Session> {
             sessions.push(s);
             continue;
         }
+
+        s.connected_clients = connected_clients(&session_meta.name);
 
         s.panes = get_panes(&session_meta.name);
 
@@ -459,6 +464,9 @@ fn print_table(sessions: &[Session]) {
                 AgeTier::Stale => name_styles.push(DIM),
                 AgeTier::Old | AgeTier::Exited => name_styles.push(BRIGHT_BLACK),
             }
+        }
+        if s.connected_clients > 0 {
+            name_styles.push(UNDERLINE);
         }
         let name_display = paint(&s.name, &name_styles);
         let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
