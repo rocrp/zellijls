@@ -394,7 +394,7 @@ pub(crate) fn cmd_summary(session: &Session) -> String {
         let base = base_name(&pane.command);
         if is_agent(&pane.command) {
             let ind = match session.agent_state {
-                Some(AgentState::Working) => "\u{1f3d7}\u{fe0f}",
+                Some(AgentState::Working) => "\u{1f6a7}",
                 _ => "\u{1f4a4}",
             };
             commands.push(format!("{base} {ind}"));
@@ -441,7 +441,7 @@ fn print_table(sessions: &[Session]) {
         .max(3);
 
     println!(
-        "{DIM}{:<max_name$}  {:<max_cmd$}  {:>max_age$}  TASK{RESET}",
+        "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}  TASK{RESET}",
         "SESSION", "STATUS", "AGE"
     );
     println!(
@@ -486,7 +486,7 @@ fn print_table(sessions: &[Session]) {
         }
         let cmd_display = paint(cmd_text, &cmd_styles);
 
-        let age_text = format!("{:>max_age$}", s.age);
+        let age_text = format!("{:<max_age$}", s.age);
         let age_display = match tier {
             AgeTier::Freshest => paint(&age_text, &[GREEN, BOLD]),
             AgeTier::Recent => paint(&age_text, &[GREEN]),

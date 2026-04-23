@@ -192,7 +192,7 @@ connected_clients 1
         assert_eq!(
             SessionAge::from_modified_time(modified, now),
             SessionAge {
-                label: "1h 2m 3s".to_string(),
+                label: "1h".to_string(),
                 seconds: 3_723,
             }
         );

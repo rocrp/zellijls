@@ -111,7 +111,7 @@ pub fn run(sessions: &[Session]) -> Option<String> {
             let age = if s.age.is_empty() {
                 String::new()
             } else {
-                let age_text = format!("{:>max_age$}", s.age);
+                let age_text = format!("{:<max_age$}", s.age);
                 match tier {
                     AgeTier::Freshest => paint(&age_text, &[GREEN, BOLD]),
                     AgeTier::Recent => paint(&age_text, &[GREEN]),

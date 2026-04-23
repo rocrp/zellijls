@@ -42,27 +42,19 @@ pub(crate) fn parse_age_seconds(age: &str) -> Option<u64> {
 }
 
 pub(crate) fn format_age(age_seconds: u64) -> String {
-    let days = age_seconds / (24 * 60 * 60);
-    let hours = (age_seconds % (24 * 60 * 60)) / (60 * 60);
-    let minutes = (age_seconds % (60 * 60)) / 60;
-    let seconds = age_seconds % 60;
+    const DAY: u64 = 24 * 60 * 60;
+    const HOUR: u64 = 60 * 60;
+    const MINUTE: u64 = 60;
 
-    let mut parts = Vec::new();
-    if days > 0 {
-        let suffix = if days == 1 { "day" } else { "days" };
-        parts.push(format!("{days}{suffix}"));
+    if age_seconds >= DAY {
+        format!("{}d", age_seconds / DAY)
+    } else if age_seconds >= HOUR {
+        format!("{}h", age_seconds / HOUR)
+    } else if age_seconds >= MINUTE {
+        format!("{}m", age_seconds / MINUTE)
+    } else {
+        format!("{age_seconds}s")
     }
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if minutes > 0 {
-        parts.push(format!("{minutes}m"));
-    }
-    if seconds > 0 || parts.is_empty() {
-        parts.push(format!("{seconds}s"));
-    }
-
-    parts.join(" ")
 }
 
 pub(crate) fn freshest_age_seconds(sessions: &[Session]) -> Option<u64> {
@@ -146,11 +138,11 @@ mod tests {
     fn formats_multi_part_ages() {
         assert_eq!(format_age(0), "0s");
         assert_eq!(format_age(53), "53s");
-        assert_eq!(format_age(53 * 60 + 49), "53m 49s");
-        assert_eq!(format_age(20 * 60 * 60 + 7 * 60 + 9), "20h 7m 9s");
+        assert_eq!(format_age(53 * 60 + 49), "53m");
+        assert_eq!(format_age(20 * 60 * 60 + 7 * 60 + 9), "20h");
         assert_eq!(
             format_age(6 * 24 * 60 * 60 + 21 * 60 * 60 + 57 * 60 + 23),
-            "6days 21h 57m 23s"
+            "6d"
         );
     }
 
