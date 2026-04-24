@@ -12,13 +12,20 @@ pub(crate) struct SessionAge {
     pub seconds: u64,
 }
 
-/// Enumerate active zellij sessions from the on-disk session_info dirs,
-/// bypassing the ~80ms `zellij ls` subprocess. A session is considered active
-/// if its directory contains `session-metadata.kdl`. The directory's mtime is
-/// a good proxy for "last active" (zellij rewrites the metadata file every
-/// tick so that file's mtime is always ~now).
-pub(crate) fn list_active_sessions() -> Vec<(String, SessionAge)> {
+#[derive(Debug)]
+pub(crate) struct SessionEntry {
+    pub name: String,
+    pub age: SessionAge,
+    pub is_exited: bool,
+}
+
+/// Enumerate zellij sessions from the on-disk session_info dirs, bypassing
+/// the ~80ms `zellij ls` subprocess. A session is listed if its directory
+/// contains `session-metadata.kdl`. Active vs exited is determined by
+/// whether a matching socket dir exists in the runtime dir.
+pub(crate) fn list_sessions() -> Vec<SessionEntry> {
     let now = SystemTime::now();
+    let alive = live_session_names();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
 
@@ -34,13 +41,25 @@ pub(crate) fn list_active_sessions() -> Vec<(String, SessionAge)> {
                 continue;
             }
             let dir = entry.path();
-            if !dir.join("session-metadata.kdl").exists() {
+            let metadata_path = dir.join("session-metadata.kdl");
+            if !metadata_path.exists() {
                 continue;
             }
-            let Ok(modified) = fs::metadata(&dir).and_then(|m| m.modified()) else {
-                continue;
+            let is_exited = !alive.contains(&name);
+            let age = if is_exited {
+                // For exited sessions, directory mtime is unreliable (gets
+                // touched by `zellij ls`). Use `creation_time` from the
+                // metadata (session uptime in seconds) instead.
+                age_from_creation_time(&metadata_path)
+                    .unwrap_or_else(|| age_from_mtime(&dir, now))
+            } else {
+                age_from_mtime(&dir, now)
             };
-            out.push((name, SessionAge::from_modified_time(modified, now)));
+            out.push(SessionEntry {
+                name,
+                age,
+                is_exited,
+            });
         }
     }
     out
@@ -70,6 +89,86 @@ fn session_info_dir(session_name: &str) -> Option<PathBuf> {
         .iter()
         .map(|root| root.join(session_name))
         .find(|path| path.is_dir())
+}
+
+fn age_from_mtime(dir: &std::path::Path, now: SystemTime) -> SessionAge {
+    let modified = fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .unwrap_or(now);
+    SessionAge::from_modified_time(modified, now)
+}
+
+/// Parse `creation_time <seconds>` from session-metadata.kdl. This field
+/// records the session's total uptime in seconds, which is a stable age
+/// indicator for exited sessions whose directory mtime gets clobbered.
+fn age_from_creation_time(metadata_path: &std::path::Path) -> Option<SessionAge> {
+    let text = fs::read_to_string(metadata_path).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("creation_time ") {
+            let secs: u64 = rest.trim().parse().ok()?;
+            return Some(SessionAge {
+                label: format_age(secs),
+                seconds: secs,
+            });
+        }
+    }
+    None
+}
+
+/// Session names that have a live server (socket dir in the runtime dir).
+/// Sessions present in session_info but absent here are EXITED.
+fn live_session_names() -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for root in runtime_roots() {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+fn runtime_roots() -> &'static Vec<PathBuf> {
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS.get_or_init(discover_runtime_roots)
+}
+
+fn discover_runtime_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let tmp = env::var("TMPDIR")
+        .or_else(|_| env::var("TEMP"))
+        .unwrap_or_else(|_| "/tmp".into());
+    let tmp = PathBuf::from(tmp);
+
+    // Zellij runtime dir: $TMPDIR/zellij-<UID>/contract_version_*/<session>
+    let Ok(tmp_entries) = fs::read_dir(&tmp) else {
+        return roots;
+    };
+    for tmp_entry in tmp_entries.flatten() {
+        let Some(dname) = tmp_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !dname.starts_with("zellij-") {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(tmp_entry.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("contract_version_") && path.is_dir() && !roots.contains(&path)
+                {
+                    roots.push(path);
+                }
+            }
+        }
+    }
+    roots
 }
 
 fn session_info_roots() -> &'static Vec<PathBuf> {

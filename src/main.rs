@@ -3,7 +3,7 @@ mod pick;
 mod session_info;
 
 use age::{AgeTier, age_tier, freshest_age_seconds, sort_sessions_for_display};
-use session_info::{connected_clients, list_active_sessions};
+use session_info::{connected_clients, list_sessions};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -194,16 +194,16 @@ fn run_cmd(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<Str
 
 fn get_session_list() -> Vec<SessionMeta> {
     let current = std::env::var("ZELLIJ_SESSION_NAME").ok();
-    list_active_sessions()
+    list_sessions()
         .into_iter()
-        .map(|(name, age)| {
-            let is_current = current.as_deref() == Some(name.as_str());
+        .map(|entry| {
+            let is_current = current.as_deref() == Some(entry.name.as_str());
             SessionMeta {
-                name,
-                age: age.label,
-                age_seconds: age.seconds,
+                name: entry.name,
+                age: entry.age.label,
+                age_seconds: entry.age.seconds,
                 is_current,
-                is_exited: false,
+                is_exited: entry.is_exited,
             }
         })
         .collect()
