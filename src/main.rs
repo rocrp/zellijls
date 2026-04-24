@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Instant;
 
-use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState};
+use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, TcpState};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use unicode_width::UnicodeWidthChar;
@@ -223,12 +223,16 @@ fn get_panes(session: &str) -> Vec<Pane> {
 
 // --- Process inspection (no subprocess!) ---
 
+fn is_agent_process(process: &sysinfo::Process) -> bool {
+    let name = process.name().to_string_lossy();
+    let base = name.rsplit('/').next().unwrap_or(&name);
+    AGENT_COMMANDS.contains(&base) || base.starts_with("codex-")
+}
+
 fn build_agent_pid_map(sys: &System) -> HashMap<String, Vec<u32>> {
     let mut map: HashMap<String, Vec<u32>> = HashMap::new();
     for process in sys.processes().values() {
-        let name = process.name().to_string_lossy();
-        let base = name.rsplit('/').next().unwrap_or(&name);
-        if !AGENT_COMMANDS.contains(&base) && !base.starts_with("codex-") {
+        if !is_agent_process(process) {
             continue;
         }
         if let Some(cwd) = process.cwd() {
@@ -240,7 +244,11 @@ fn build_agent_pid_map(sys: &System) -> HashMap<String, Vec<u32>> {
     map
 }
 
-fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> HashSet<u32> {
+fn build_working_pids(
+    sys: &System,
+    agent_pids: &HashMap<String, Vec<u32>>,
+    sockets: &[SocketInfo],
+) -> HashSet<u32> {
     let all_pids: HashSet<u32> = agent_pids.values().flatten().copied().collect();
     if all_pids.is_empty() {
         return HashSet::new();
@@ -256,23 +264,20 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
         }
     }
 
-    let af = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-    let proto = ProtocolFlags::TCP;
-    if let Ok(sockets) = netstat2::get_sockets_info(af, proto) {
-        for si in sockets {
-            if let ProtocolSocketInfo::Tcp(ref tcp) = si.protocol_socket_info {
-                if tcp.state != TcpState::Established || tcp.remote_addr.is_loopback() {
-                    continue;
-                }
-                for &pid in &si.associated_pids {
-                    if all_pids.contains(&pid)
-                        && !working.contains(&pid)
-                        && let Some(process) = sys.process(Pid::from_u32(pid))
-                        && process.cpu_usage() > 0.5
-                    {
-                        working.insert(pid);
-                    }
-                }
+    for si in sockets {
+        let ProtocolSocketInfo::Tcp(ref tcp) = si.protocol_socket_info else {
+            continue;
+        };
+        if tcp.state != TcpState::Established || tcp.remote_addr.is_loopback() {
+            continue;
+        }
+        for &pid in &si.associated_pids {
+            if all_pids.contains(&pid)
+                && !working.contains(&pid)
+                && let Some(process) = sys.process(Pid::from_u32(pid))
+                && process.cpu_usage() > 0.5
+            {
+                working.insert(pid);
             }
         }
     }
@@ -282,24 +287,54 @@ fn build_working_pids(sys: &System, agent_pids: &HashMap<String, Vec<u32>>) -> H
 // --- Session building ---
 
 fn build_sessions() -> Vec<Session> {
-    let meta = get_session_list();
+    // Run the three independent startup probes concurrently: the `zellij ls`
+    // subprocess, the first sysinfo refresh (for a CPU baseline), and the TCP
+    // socket table scan. None of them read each other's output.
+    let (meta, mut sys, sockets) = std::thread::scope(|s| {
+        let meta_h = s.spawn(get_session_list);
+        let sys_h = s.spawn(|| {
+            let mut sys = System::new();
+            // Phase A: broad scan — skip cwd here. The cwd syscall is the
+            // expensive part on macOS; we'll refresh cwd only for agent PIDs
+            // later in Phase B.
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_cpu(),
+            );
+            sys
+        });
+        let sock_h = s.spawn(|| {
+            netstat2::get_sockets_info(
+                AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
+                ProtocolFlags::TCP,
+            )
+            .unwrap_or_default()
+        });
+        (
+            meta_h.join().unwrap(),
+            sys_h.join().unwrap(),
+            sock_h.join().unwrap(),
+        )
+    });
+
     if meta.is_empty() {
         return vec![];
     }
 
     let cpu_sample_start = Instant::now();
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cwd(UpdateKind::Always)
-            .with_cpu(),
-    );
-    let agent_pid_map = build_agent_pid_map(&sys);
 
-    // Pane queries must be sequential (zellij race condition drops fields).
-    // This also serves as natural delay between CPU samples.
+    // Agent PIDs identified by process name alone; cwd gets populated in Phase B.
+    let agent_pids: Vec<Pid> = sys
+        .processes()
+        .values()
+        .filter(|p| is_agent_process(p))
+        .map(|p| p.pid())
+        .collect();
+
+    // Pane queries must be sequential (zellij race condition drops fields on
+    // concurrent `action list-panes` calls). Doubles as elapsed time between
+    // the two CPU samples.
     let mut sessions: Vec<Session> = Vec::with_capacity(meta.len());
     for session_meta in &meta {
         let mut s = Session {
@@ -320,7 +355,6 @@ fn build_sessions() -> Vec<Session> {
         }
 
         s.connected_clients = connected_clients(&session_meta.name);
-
         s.panes = get_panes(&session_meta.name);
 
         for pane in &s.panes {
@@ -333,22 +367,27 @@ fn build_sessions() -> Vec<Session> {
         sessions.push(s);
     }
 
-    // Ensure minimum 200ms between CPU samples for accuracy
-    let min_delay = std::time::Duration::from_millis(200);
+    // Ensure ≥ 100ms between CPU samples for sysinfo delta accuracy. Pane
+    // queries normally cover this on their own; we only sleep the shortfall.
+    let min_delay = std::time::Duration::from_millis(100);
     let elapsed = cpu_sample_start.elapsed();
     if elapsed < min_delay {
         std::thread::sleep(min_delay - elapsed);
     }
 
+    // Phase B: targeted refresh — only agent PIDs, this time with cwd.
     sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
+        ProcessesToUpdate::Some(&agent_pids),
         true,
-        ProcessRefreshKind::nothing().with_cpu(),
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_cwd(UpdateKind::Always),
     );
 
-    let working_pids = build_working_pids(&sys, &agent_pid_map);
+    let agent_pid_map = build_agent_pid_map(&sys);
+    let working_pids = build_working_pids(&sys, &agent_pid_map, &sockets);
 
-    // Determine agent state — spinner (Claude's own UI signal) takes priority
+    // Determine agent state — spinner (Claude's own UI signal) takes priority.
     for s in &mut sessions {
         for pane in &s.panes {
             if !is_agent(&pane.command) {
