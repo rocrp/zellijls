@@ -12,35 +12,6 @@ pub(crate) enum AgeTier {
     Exited,
 }
 
-pub(crate) fn parse_age_seconds(age: &str) -> Option<u64> {
-    let mut total = 0u64;
-    let mut matched = false;
-
-    for token in age.split_whitespace() {
-        let digits_end = token
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(token.len());
-        if digits_end == 0 || digits_end == token.len() {
-            return None;
-        }
-
-        let value = token[..digits_end].parse::<u64>().ok()?;
-        let unit = token[digits_end..].to_ascii_lowercase();
-        let seconds = match unit.as_str() {
-            "d" | "day" | "days" => value.checked_mul(24 * 60 * 60)?,
-            "h" | "hr" | "hrs" | "hour" | "hours" => value.checked_mul(60 * 60)?,
-            "m" | "min" | "mins" | "minute" | "minutes" => value.checked_mul(60)?,
-            "s" | "sec" | "secs" | "second" | "seconds" => value,
-            _ => return None,
-        };
-
-        total = total.checked_add(seconds)?;
-        matched = true;
-    }
-
-    matched.then_some(total)
-}
-
 pub(crate) fn format_age(age_seconds: u64) -> String {
     const DAY: u64 = 24 * 60 * 60;
     const HOUR: u64 = 60 * 60;
@@ -89,10 +60,7 @@ pub(crate) fn sort_sessions_for_display(sessions: &mut [Session]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        age_tier, format_age, freshest_age_seconds, parse_age_seconds, sort_sessions_for_display,
-        AgeTier,
-    };
+    use super::{age_tier, format_age, freshest_age_seconds, sort_sessions_for_display, AgeTier};
     use crate::{Pane, Session};
 
     fn session(name: &str, age_seconds: u64, is_current: bool, is_exited: bool) -> Session {
@@ -107,31 +75,6 @@ mod tests {
             agent_state: None,
             task: String::new(),
         }
-    }
-
-    #[test]
-    fn parses_multi_part_ages() {
-        assert_eq!(parse_age_seconds("53s"), Some(53));
-        assert_eq!(parse_age_seconds("53m 49s"), Some(53 * 60 + 49));
-        assert_eq!(
-            parse_age_seconds("20h 7m 9s"),
-            Some(20 * 60 * 60 + 7 * 60 + 9)
-        );
-        assert_eq!(
-            parse_age_seconds("6days 21h 57m 23s"),
-            Some(6 * 24 * 60 * 60 + 21 * 60 * 60 + 57 * 60 + 23)
-        );
-        assert_eq!(
-            parse_age_seconds("1day 2hours 3minutes 4seconds"),
-            Some(93_784)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_age_format() {
-        assert_eq!(parse_age_seconds("soon"), None);
-        assert_eq!(parse_age_seconds("7"), None);
-        assert_eq!(parse_age_seconds("1fortnight"), None);
     }
 
     #[test]

@@ -1,11 +1,10 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-use crate::age::{format_age, parse_age_seconds};
+use crate::age::format_age;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionAge {
@@ -13,8 +12,38 @@ pub(crate) struct SessionAge {
     pub seconds: u64,
 }
 
-pub(crate) fn session_age(session_name: &str, created_age: &str) -> SessionAge {
-    updated_session_age(session_name).unwrap_or_else(|| created_session_age(created_age))
+/// Enumerate active zellij sessions from the on-disk session_info dirs,
+/// bypassing the ~80ms `zellij ls` subprocess. A session is considered active
+/// if its directory contains `session-metadata.kdl`. The directory's mtime is
+/// a good proxy for "last active" (zellij rewrites the metadata file every
+/// tick so that file's mtime is always ~now).
+pub(crate) fn list_active_sessions() -> Vec<(String, SessionAge)> {
+    let now = SystemTime::now();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for root in session_info_roots() {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let dir = entry.path();
+            if !dir.join("session-metadata.kdl").exists() {
+                continue;
+            }
+            let Ok(modified) = fs::metadata(&dir).and_then(|m| m.modified()) else {
+                continue;
+            };
+            out.push((name, SessionAge::from_modified_time(modified, now)));
+        }
+    }
+    out
 }
 
 pub(crate) fn connected_clients(session_name: &str) -> u32 {
@@ -34,21 +63,6 @@ fn parse_connected_clients(text: &str) -> u32 {
         }
     }
     0
-}
-
-fn updated_session_age(session_name: &str) -> Option<SessionAge> {
-    let session_info_dir = session_info_dir(session_name)?;
-    let modified = fs::metadata(session_info_dir).ok()?.modified().ok()?;
-    Some(SessionAge::from_modified_time(modified, SystemTime::now()))
-}
-
-fn created_session_age(created_age: &str) -> SessionAge {
-    let seconds = parse_age_seconds(created_age)
-        .unwrap_or_else(|| panic!("unsupported zellij age format: {created_age}"));
-    SessionAge {
-        label: created_age.to_string(),
-        seconds,
-    }
 }
 
 fn session_info_dir(session_name: &str) -> Option<PathBuf> {
@@ -89,45 +103,14 @@ fn discover_session_info_roots() -> Vec<PathBuf> {
 }
 
 fn cache_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Some(cache_dir) = zellij_cache_dir() {
-        dirs.push(cache_dir);
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        let macos_cache_dir = home.join("Library/Caches/org.Zellij-Contributors.Zellij");
-        if !dirs.contains(&macos_cache_dir) {
-            dirs.push(macos_cache_dir);
-        }
-
-        let xdg_cache_dir = home.join(".cache/zellij");
-        if !dirs.contains(&xdg_cache_dir) {
-            dirs.push(xdg_cache_dir);
-        }
-    }
-
-    dirs
-}
-
-fn zellij_cache_dir() -> Option<PathBuf> {
-    let output = Command::new("zellij")
-        .args(["setup", "--check"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    parse_cache_dir(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_cache_dir(output: &str) -> Option<PathBuf> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("[CACHE DIR]: "))
-        .map(|path| PathBuf::from(path.trim_matches('"')))
+    let Some(home) = env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    vec![
+        home.join("Library/Caches/org.Zellij-Contributors.Zellij"),
+        home.join(".cache/zellij"),
+    ]
 }
 
 impl SessionAge {
@@ -145,25 +128,8 @@ impl SessionAge {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cache_dir, parse_connected_clients, SessionAge};
-    use std::path::PathBuf;
+    use super::{parse_connected_clients, SessionAge};
     use std::time::{Duration, UNIX_EPOCH};
-
-    #[test]
-    fn parses_cache_dir_from_setup_output() {
-        let output = r#"
-[Version]: "0.44.1"
-[CACHE DIR]: /Users/test/Library/Caches/org.Zellij-Contributors.Zellij
-[DATA DIR]: "/Users/test/Library/Application Support/org.Zellij-Contributors.Zellij"
-"#;
-
-        assert_eq!(
-            parse_cache_dir(output),
-            Some(PathBuf::from(
-                "/Users/test/Library/Caches/org.Zellij-Contributors.Zellij"
-            ))
-        );
-    }
 
     #[test]
     fn parses_connected_clients_from_metadata() {

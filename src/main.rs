@@ -3,9 +3,8 @@ mod pick;
 mod session_info;
 
 use age::{AgeTier, age_tier, freshest_age_seconds, sort_sessions_for_display};
-use session_info::{connected_clients, session_age};
+use session_info::{connected_clients, list_active_sessions};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 use std::time::Instant;
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, TcpState};
@@ -154,56 +153,69 @@ fn extract_task(title: &str) -> &str {
     t.trim_start()
 }
 
-fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
+/// Run a subprocess with a hard wall-clock timeout. Returns None if the
+/// process fails, exits non-zero, or is killed for exceeding `timeout` (e.g.
+/// a wedged zellij server). Robustness matters here — without a timeout a
+/// single stuck session server would hang the whole CLI indefinitely.
+fn run_cmd(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(cmd)
         .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let result = match rx.recv_timeout(timeout) {
+        Ok(buf) => Some(buf),
+        Err(_) => {
+            let _ = child.kill();
+            None
+        }
+    };
+    let _ = child.wait();
+    let _ = reader.join();
+
+    let buf = result?;
+    Some(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
 // --- Zellij queries ---
 
 fn get_session_list() -> Vec<SessionMeta> {
-    let Some(out) = run_cmd("zellij", &["ls", "--no-formatting"]) else {
-        return vec![];
-    };
-    out.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let name = line
-                .split_whitespace()
-                .next()
-                .unwrap_or_else(|| panic!("missing session name in `zellij ls` output: {line}"))
-                .to_string();
-            let is_current = line.contains("(current)");
-            let is_exited = line.contains("EXITED");
-            let created_age = line
-                .find("[Created ")
-                .and_then(|i| {
-                    let rest = &line[i + 9..];
-                    rest.find(" ago]").map(|end| rest[..end].to_string())
-                })
-                .unwrap_or_else(|| panic!("missing age in `zellij ls` output: {line}"));
-            let age = session_age(&name, &created_age);
-
+    let current = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    list_active_sessions()
+        .into_iter()
+        .map(|(name, age)| {
+            let is_current = current.as_deref() == Some(name.as_str());
             SessionMeta {
                 name,
                 age: age.label,
                 age_seconds: age.seconds,
                 is_current,
-                is_exited,
+                is_exited: false,
             }
         })
         .collect()
 }
 
 fn get_panes(session: &str) -> Vec<Pane> {
+    // Normal queries finish in ~50-100ms; anything past 1s is a wedged
+    // session server and we'd rather degrade to "empty" than hang the CLI.
     let Some(json_str) = run_cmd(
         "zellij",
         &["-s", session, "action", "list-panes", "--all", "--json"],
+        std::time::Duration::from_secs(1),
     ) else {
         return vec![];
     };
@@ -287,16 +299,24 @@ fn build_working_pids(
 // --- Session building ---
 
 fn build_sessions() -> Vec<Session> {
-    // Run the three independent startup probes concurrently: the `zellij ls`
-    // subprocess, the first sysinfo refresh (for a CPU baseline), and the TCP
-    // socket table scan. None of them read each other's output.
-    let (meta, mut sys, sockets) = std::thread::scope(|s| {
-        let meta_h = s.spawn(get_session_list);
+    let meta = get_session_list();
+    if meta.is_empty() {
+        return vec![];
+    }
+
+    let cpu_sample_start = Instant::now();
+
+    // Everything below runs concurrently:
+    //  - Phase A: broad sysinfo refresh (CPU only; cwd is expensive on macOS
+    //    and we only need it for agent PIDs, refreshed later in Phase B).
+    //  - TCP socket table scan for detecting network-active agents.
+    //  - Pane queries per session. `zellij action list-panes` drops fields
+    //    (e.g. `pane_command`) when ≥5 invocations run concurrently, so we
+    //    batch 2-wide — empirically stable across 30+ torture runs.
+    const PANE_QUERY_CONCURRENCY: usize = 2;
+    let (mut sys, sockets, pane_data) = std::thread::scope(|s| {
         let sys_h = s.spawn(|| {
             let mut sys = System::new();
-            // Phase A: broad scan — skip cwd here. The cwd syscall is the
-            // expensive part on macOS; we'll refresh cwd only for agent PIDs
-            // later in Phase B.
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
@@ -311,18 +331,37 @@ fn build_sessions() -> Vec<Session> {
             )
             .unwrap_or_default()
         });
+        let pane_h = s.spawn(|| {
+            let mut out: Vec<(u32, Vec<Pane>)> = Vec::with_capacity(meta.len());
+            std::thread::scope(|ps| {
+                for batch in meta.chunks(PANE_QUERY_CONCURRENCY) {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|m| {
+                            let name = m.name.clone();
+                            let exited = m.is_exited;
+                            ps.spawn(move || {
+                                if exited {
+                                    (0, Vec::new())
+                                } else {
+                                    (connected_clients(&name), get_panes(&name))
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        out.push(h.join().unwrap());
+                    }
+                }
+            });
+            out
+        });
         (
-            meta_h.join().unwrap(),
             sys_h.join().unwrap(),
             sock_h.join().unwrap(),
+            pane_h.join().unwrap(),
         )
     });
-
-    if meta.is_empty() {
-        return vec![];
-    }
-
-    let cpu_sample_start = Instant::now();
 
     // Agent PIDs identified by process name alone; cwd gets populated in Phase B.
     let agent_pids: Vec<Pid> = sys
@@ -332,40 +371,28 @@ fn build_sessions() -> Vec<Session> {
         .map(|p| p.pid())
         .collect();
 
-    // Pane queries must be sequential (zellij race condition drops fields on
-    // concurrent `action list-panes` calls). Doubles as elapsed time between
-    // the two CPU samples.
-    let mut sessions: Vec<Session> = Vec::with_capacity(meta.len());
-    for session_meta in &meta {
-        let mut s = Session {
-            name: session_meta.name.clone(),
-            age: session_meta.age.clone(),
-            age_seconds: session_meta.age_seconds,
-            is_current: session_meta.is_current,
-            is_exited: session_meta.is_exited,
-            connected_clients: 0,
-            panes: vec![],
-            agent_state: None,
-            task: String::new(),
-        };
-
-        if session_meta.is_exited {
-            sessions.push(s);
-            continue;
-        }
-
-        s.connected_clients = connected_clients(&session_meta.name);
-        s.panes = get_panes(&session_meta.name);
-
-        for pane in &s.panes {
-            if is_agent(&pane.command) {
-                s.task = extract_task(&pane.title).to_string();
-                break;
+    let mut sessions: Vec<Session> = meta
+        .iter()
+        .zip(pane_data)
+        .map(|(m, (clients, panes))| {
+            let task = panes
+                .iter()
+                .find(|p| is_agent(&p.command))
+                .map(|p| extract_task(&p.title).to_string())
+                .unwrap_or_default();
+            Session {
+                name: m.name.clone(),
+                age: m.age.clone(),
+                age_seconds: m.age_seconds,
+                is_current: m.is_current,
+                is_exited: m.is_exited,
+                connected_clients: clients,
+                panes,
+                agent_state: None,
+                task,
             }
-        }
-
-        sessions.push(s);
-    }
+        })
+        .collect();
 
     // Ensure ≥ 100ms between CPU samples for sysinfo delta accuracy. Pane
     // queries normally cover this on their own; we only sleep the shortfall.
