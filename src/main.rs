@@ -22,6 +22,7 @@ pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const BOLD: &str = "\x1b[1m";
 pub(crate) const UNDERLINE: &str = "\x1b[4m";
+pub(crate) const STRIKETHROUGH: &str = "\x1b[9m";
 
 const IDLE_SHELLS: &[&str] = &["zsh", "bash", "sh", "fish"];
 const AGENT_COMMANDS: &[&str] = &["claude", "codex", "codex-aarch64-apple-darwin"];
@@ -443,7 +444,7 @@ fn build_sessions() -> Vec<Session> {
 
 pub(crate) fn cmd_summary(session: &Session) -> String {
     if session.is_exited {
-        return "exited".into();
+        return "\u{1faa6} exited".into(); // 🪦
     }
 
     let mut commands = Vec::new();
@@ -528,7 +529,8 @@ fn print_table(sessions: &[Session]) {
                 AgeTier::Freshest => name_styles.extend([BRIGHT_CYAN, BOLD]),
                 AgeTier::Recent => {}
                 AgeTier::Stale => name_styles.push(DIM),
-                AgeTier::Old | AgeTier::Exited => name_styles.push(BRIGHT_BLACK),
+                AgeTier::Old => name_styles.push(BRIGHT_BLACK),
+                AgeTier::Exited => name_styles.extend([BRIGHT_BLACK, STRIKETHROUGH]),
             }
         }
         if s.connected_clients > 0 {
