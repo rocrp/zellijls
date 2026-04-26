@@ -23,6 +23,12 @@ pub(crate) struct SessionEntry {
 /// the ~80ms `zellij ls` subprocess. A session is listed if its directory
 /// contains `session-metadata.kdl`. Active vs exited is determined by
 /// whether a matching socket dir exists in the runtime dir.
+///
+/// Age is the mtime of `session-metadata.kdl`: zellij rewrites this file
+/// while the session is alive, so for active sessions it tracks last
+/// activity, and for exited sessions it tracks the last write before the
+/// server died. The parent dir mtime doesn't move on inner-file rewrites,
+/// so it can't be used here.
 pub(crate) fn list_sessions() -> Vec<SessionEntry> {
     let now = SystemTime::now();
     let alive = live_session_names();
@@ -40,24 +46,14 @@ pub(crate) fn list_sessions() -> Vec<SessionEntry> {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let dir = entry.path();
-            let metadata_path = dir.join("session-metadata.kdl");
+            let metadata_path = entry.path().join("session-metadata.kdl");
             if !metadata_path.exists() {
                 continue;
             }
             let is_exited = !alive.contains(&name);
-            let age = if is_exited {
-                // For exited sessions, directory mtime is unreliable (gets
-                // touched by `zellij ls`). Use `creation_time` from the
-                // metadata (session uptime in seconds) instead.
-                age_from_creation_time(&metadata_path)
-                    .unwrap_or_else(|| age_from_mtime(&dir, now))
-            } else {
-                age_from_mtime(&dir, now)
-            };
             out.push(SessionEntry {
                 name,
-                age,
+                age: age_from_mtime(&metadata_path, now),
                 is_exited,
             });
         }
@@ -91,28 +87,9 @@ fn session_info_dir(session_name: &str) -> Option<PathBuf> {
         .find(|path| path.is_dir())
 }
 
-fn age_from_mtime(dir: &std::path::Path, now: SystemTime) -> SessionAge {
-    let modified = fs::metadata(dir)
-        .and_then(|m| m.modified())
-        .unwrap_or(now);
+fn age_from_mtime(path: &std::path::Path, now: SystemTime) -> SessionAge {
+    let modified = fs::metadata(path).and_then(|m| m.modified()).unwrap_or(now);
     SessionAge::from_modified_time(modified, now)
-}
-
-/// Parse `creation_time <seconds>` from session-metadata.kdl. This field
-/// records the session's total uptime in seconds, which is a stable age
-/// indicator for exited sessions whose directory mtime gets clobbered.
-fn age_from_creation_time(metadata_path: &std::path::Path) -> Option<SessionAge> {
-    let text = fs::read_to_string(metadata_path).ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("creation_time ") {
-            let secs: u64 = rest.trim().parse().ok()?;
-            return Some(SessionAge {
-                label: format_age(secs),
-                seconds: secs,
-            });
-        }
-    }
-    None
 }
 
 /// Session names that have a live server (socket dir in the runtime dir).

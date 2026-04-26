@@ -1,11 +1,13 @@
 mod age;
 mod pick;
 mod session_info;
+#[cfg(target_os = "macos")]
+mod tty_age;
 
-use age::{AgeTier, age_tier, freshest_age_seconds, sort_sessions_for_display};
+use age::{AgeTier, age_tier, format_age, freshest_age_seconds, sort_sessions_for_display};
 use session_info::{connected_clients, list_sessions};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, TcpState};
 use serde::Deserialize;
@@ -372,6 +374,21 @@ fn build_sessions() -> Vec<Session> {
         .map(|p| p.pid())
         .collect();
 
+    // Zellij PIDs (any role: server/client/etc.) — cmd line gets populated
+    // in Phase B so we can pick out the `--server` ones and map them back
+    // to session names for TTY-mtime activity probing.
+    #[cfg(target_os = "macos")]
+    let zellij_pids: Vec<Pid> = sys
+        .processes()
+        .values()
+        .filter(|p| {
+            let name = p.name().to_string_lossy();
+            let base = name.rsplit('/').next().unwrap_or(&name);
+            base == "zellij"
+        })
+        .map(|p| p.pid())
+        .collect();
+
     let mut sessions: Vec<Session> = meta
         .iter()
         .zip(pane_data)
@@ -411,6 +428,34 @@ fn build_sessions() -> Vec<Session> {
             .with_cpu()
             .with_cwd(UpdateKind::Always),
     );
+
+    // Targeted refresh for zellij PIDs to pull `cmd` (cheap on macOS:
+    // single sysctl per PID, ~5–10 PIDs typical). Then derive per-session
+    // last-activity timestamps from PTY slave mtime and overwrite the
+    // metadata-mtime age, which is uselessly fresh for live sessions
+    // because zellij rewrites the metadata on every tick.
+    #[cfg(target_os = "macos")]
+    {
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&zellij_pids),
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let server_by_session = tty_age::discover_servers(&sys, &zellij_pids);
+        let activity = tty_age::last_activity_per_session(&sys, &server_by_session);
+        let now = SystemTime::now();
+        for s in &mut sessions {
+            if s.is_exited {
+                continue;
+            }
+            let Some(mtime) = activity.get(&s.name) else {
+                continue;
+            };
+            let secs = now.duration_since(*mtime).unwrap_or_default().as_secs();
+            s.age_seconds = secs;
+            s.age = format_age(secs);
+        }
+    }
 
     let agent_pid_map = build_agent_pid_map(&sys);
     let working_pids = build_working_pids(&sys, &agent_pid_map, &sockets);
