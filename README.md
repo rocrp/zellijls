@@ -22,6 +22,20 @@ hntui    exited          4h
 
 ## Install
 
+Homebrew (macOS / Linux):
+
+```sh
+brew install rocrp/tap/zellijls
+```
+
+Install script (macOS / Linux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rocrp/zellijls/main/scripts/install.sh | bash
+```
+
+From source:
+
 ```sh
 cargo install --path .
 ```
