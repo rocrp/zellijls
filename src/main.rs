@@ -596,37 +596,60 @@ fn print_table(sessions: &[Session]) {
         .unwrap_or(3)
         .max(3);
 
-    // Task column budget: shrink (or drop) the TASK column so the whole row
-    // fits the terminal. On non-TTY (e.g., piped output), keep the original
-    // 50-cell cap and never drop the column.
+    // Fit the row to the terminal by shrinking columns in priority order:
+    // SESSION and AGE keep their natural widths; STATUS truncates when needed;
+    // TASK shrinks first, then drops entirely. Non-TTY (piped) output keeps
+    // full STATUS and the original 50-cell TASK cap.
     let term_width = crossterm::terminal::size().ok().map(|(w, _)| w as usize);
-    let fixed_width = max_name + max_cmd + max_age + 6; // three "  " separators
-    let task_cap = term_width.map_or(50, |tw| tw.saturating_sub(fixed_width).min(50));
-    let show_task_column = task_cap >= 4;
+    let (cmd_cap, task_cap, show_task_column) = match term_width {
+        None => (max_cmd, 50, true),
+        Some(tw) => {
+            let inner_with_task = tw.saturating_sub(max_name + max_age + 6);
+            let inner_no_task = tw.saturating_sub(max_name + max_age + 4);
+            if inner_with_task >= max_cmd + 4 {
+                let task = (inner_with_task - max_cmd).min(50);
+                (max_cmd, task, true)
+            } else if inner_no_task >= max_cmd {
+                (max_cmd, 0, false)
+            } else {
+                (inner_no_task, 0, false)
+            }
+        }
+    };
 
     if show_task_column {
         println!(
-            "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}  TASK{RESET}",
+            "{DIM}{:<max_name$}  {:<cmd_cap$}  {:<max_age$}  TASK{RESET}",
             "SESSION", "STATUS", "AGE"
         );
     } else {
         println!(
-            "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}{RESET}",
+            "{DIM}{:<max_name$}  {:<cmd_cap$}  {:<max_age$}{RESET}",
             "SESSION", "STATUS", "AGE"
         );
     }
     let divider_len = if show_task_column {
         // 6 separator cells + "TASK" header (4) = 10 trailing cells
-        max_name + max_cmd + max_age + 10
+        max_name + cmd_cap + max_age + 10
     } else {
-        max_name + max_cmd + max_age + 4 // 2 separators between three columns
+        max_name + cmd_cap + max_age + 4 // 2 separators between three columns
     };
     println!("{DIM}{}{RESET}", "\u{2501}".repeat(divider_len));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
         let tier = age_tier(s, freshest_age);
-        let cmd_w = display_width(cmd_text);
-        let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
+        let cmd_owned;
+        let (cmd_rendered, cmd_w): (&str, usize) = {
+            let w = display_width(cmd_text);
+            if w > cmd_cap {
+                cmd_owned = truncate_to_width(cmd_text, cmd_cap);
+                let w2 = display_width(&cmd_owned);
+                (cmd_owned.as_str(), w2)
+            } else {
+                (cmd_text.as_str(), w)
+            }
+        };
+        let cmd_pad = " ".repeat(cmd_cap.saturating_sub(cmd_w));
 
         let mut name_styles = Vec::new();
         if s.is_current {
@@ -657,7 +680,7 @@ fn print_table(sessions: &[Session]) {
         {
             cmd_styles.push(color);
         }
-        let cmd_display = paint(cmd_text, &cmd_styles);
+        let cmd_display = paint(cmd_rendered, &cmd_styles);
 
         let age_text = format!("{:<max_age$}", s.age);
         let age_display = match tier {
