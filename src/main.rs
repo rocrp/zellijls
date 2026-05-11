@@ -122,7 +122,6 @@ pub(crate) fn display_width(s: &str) -> usize {
 /// `max_width < 2` (no room for even one char plus the ellipsis suffix that
 /// would otherwise be needed; a bare 1-cell char is also dropped for
 /// consistency since callers only invoke this when budget is meaningful).
-#[allow(dead_code)] // used by Task 2 (print_table truncation)
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     if max_width < 2 {
         return String::new();
@@ -597,14 +596,36 @@ fn print_table(sessions: &[Session]) {
         .unwrap_or(3)
         .max(3);
 
-    println!(
-        "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}  TASK{RESET}",
-        "SESSION", "STATUS", "AGE"
-    );
-    println!(
-        "{DIM}{}{RESET}",
-        "\u{2501}".repeat(max_name + max_cmd + max_age + 10)
-    );
+    // Task column budget: shrink (or drop) the TASK column so the whole row
+    // fits the terminal. On non-TTY (e.g., piped output), keep the original
+    // 50-cell cap and never drop the column.
+    let term_width = crossterm::terminal::size().ok().map(|(w, _)| w as usize);
+    let fixed_width = max_name + max_cmd + max_age + 6; // three "  " separators
+    let task_cap: Option<usize> = match term_width {
+        Some(tw) => Some(tw.saturating_sub(fixed_width).min(50)),
+        None => Some(50),
+    };
+    let show_task_column = task_cap.map(|c| c >= 4).unwrap_or(true);
+    let task_cap = task_cap.unwrap_or(50);
+
+    if show_task_column {
+        println!(
+            "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}  TASK{RESET}",
+            "SESSION", "STATUS", "AGE"
+        );
+    } else {
+        println!(
+            "{DIM}{:<max_name$}  {:<max_cmd$}  {:<max_age$}{RESET}",
+            "SESSION", "STATUS", "AGE"
+        );
+    }
+    let divider_len = if show_task_column {
+        // 6 separator cells + "TASK" header (4) = 10 trailing cells
+        max_name + max_cmd + max_age + 10
+    } else {
+        max_name + max_cmd + max_age + 4 // 2 separators between three columns
+    };
+    println!("{DIM}{}{RESET}", "\u{2501}".repeat(divider_len));
 
     for (s, cmd_text) in sessions.iter().zip(cmd_texts.iter()) {
         let tier = age_tier(s, freshest_age);
@@ -650,14 +671,10 @@ fn print_table(sessions: &[Session]) {
             AgeTier::Old | AgeTier::Exited => paint(&age_text, &[BRIGHT_BLACK]),
         };
 
-        let task_display = if s.task.is_empty() {
+        let task_display = if !show_task_column || s.task.is_empty() {
             String::new()
         } else {
-            let task = if s.task.len() > 50 {
-                format!("{}\u{2026}", &s.task[..49])
-            } else {
-                s.task.clone()
-            };
+            let task = truncate_to_width(&s.task, task_cap);
             if matches!(tier, AgeTier::Old | AgeTier::Exited) {
                 paint(&task, &[BRIGHT_BLACK])
             } else if s.agent_state == Some(AgentState::Waiting) || matches!(tier, AgeTier::Stale) {
@@ -667,7 +684,13 @@ fn print_table(sessions: &[Session]) {
             }
         };
 
-        println!("{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}");
+        if show_task_column {
+            println!(
+                "{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}"
+            );
+        } else {
+            println!("{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}");
+        }
     }
 }
 
