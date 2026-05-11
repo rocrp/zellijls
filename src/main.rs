@@ -601,12 +601,8 @@ fn print_table(sessions: &[Session]) {
     // 50-cell cap and never drop the column.
     let term_width = crossterm::terminal::size().ok().map(|(w, _)| w as usize);
     let fixed_width = max_name + max_cmd + max_age + 6; // three "  " separators
-    let task_cap: Option<usize> = match term_width {
-        Some(tw) => Some(tw.saturating_sub(fixed_width).min(50)),
-        None => Some(50),
-    };
-    let show_task_column = task_cap.map(|c| c >= 4).unwrap_or(true);
-    let task_cap = task_cap.unwrap_or(50);
+    let task_cap = term_width.map_or(50, |tw| tw.saturating_sub(fixed_width).min(50));
+    let show_task_column = task_cap >= 4;
 
     if show_task_column {
         println!(

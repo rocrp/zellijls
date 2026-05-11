@@ -38,8 +38,7 @@ pub(crate) fn last_activity_per_session(
 
     // Group children by their server PID in a single sysinfo pass instead
     // of N filtered scans.
-    let server_pids: std::collections::HashSet<u32> =
-        server_by_session.values().copied().collect();
+    let server_pids: std::collections::HashSet<u32> = server_by_session.values().copied().collect();
     let mut children_by_server: HashMap<u32, Vec<u32>> = HashMap::new();
     for proc in sys.processes().values() {
         let Some(parent) = proc.parent() else {

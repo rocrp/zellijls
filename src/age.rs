@@ -60,7 +60,7 @@ pub(crate) fn sort_sessions_for_display(sessions: &mut [Session]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{age_tier, format_age, freshest_age_seconds, sort_sessions_for_display, AgeTier};
+    use super::{AgeTier, age_tier, format_age, freshest_age_seconds, sort_sessions_for_display};
     use crate::{Pane, Session};
 
     fn session(name: &str, age_seconds: u64, is_current: bool, is_exited: bool) -> Session {
