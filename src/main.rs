@@ -117,6 +117,51 @@ pub(crate) fn display_width(s: &str) -> usize {
     width
 }
 
+/// Truncate `s` so its display width does not exceed `max_width`. When
+/// truncation occurs, the last cell is replaced with `…`. Returns `""` if
+/// `max_width < 2` (no room for even one char plus the ellipsis suffix that
+/// would otherwise be needed; a bare 1-cell char is also dropped for
+/// consistency since callers only invoke this when budget is meaningful).
+#[allow(dead_code)] // used by Task 2 (print_table truncation)
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if max_width < 2 {
+        return String::new();
+    }
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    // Reserve 1 cell for '…'.
+    let budget = max_width - 1;
+    let mut out = String::new();
+    let mut width = 0usize;
+    let mut prev_char_width = 0usize;
+    for c in s.chars() {
+        if c == '\u{FE0F}' {
+            // Match display_width semantics: VS16 promotes the previous
+            // text-presentation char to 2 cells.
+            if prev_char_width < 2 {
+                let extra = 2 - prev_char_width;
+                if width + extra > budget {
+                    break;
+                }
+                width += extra;
+            }
+            out.push(c);
+            prev_char_width = 0;
+            continue;
+        }
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > budget {
+            break;
+        }
+        out.push(c);
+        width += cw;
+        prev_char_width = cw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 pub(crate) fn base_name(cmd: &str) -> &str {
     let binary = cmd.split_whitespace().next().unwrap_or("");
     binary.rsplit('/').next().unwrap_or(binary)
@@ -587,15 +632,13 @@ fn print_table(sessions: &[Session]) {
         let mut cmd_styles = Vec::new();
         if matches!(tier, AgeTier::Freshest) {
             cmd_styles.push(BOLD);
-        } else if matches!(tier, AgeTier::Stale) {
-            cmd_styles.push(DIM);
-        } else if matches!(tier, AgeTier::Old | AgeTier::Exited) {
+        } else if matches!(tier, AgeTier::Stale | AgeTier::Old | AgeTier::Exited) {
             cmd_styles.push(DIM);
         }
-        if !matches!(tier, AgeTier::Old | AgeTier::Exited) {
-            if let Some(color) = status_color(s) {
-                cmd_styles.push(color);
-            }
+        if !matches!(tier, AgeTier::Old | AgeTier::Exited)
+            && let Some(color) = status_color(s)
+        {
+            cmd_styles.push(color);
         }
         let cmd_display = paint(cmd_text, &cmd_styles);
 
@@ -625,6 +668,51 @@ fn print_table(sessions: &[Session]) {
         };
 
         println!("{name_display}{name_pad}  {cmd_display}{cmd_pad}  {age_display}  {task_display}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_to_width_no_truncation_when_fits() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_ascii_truncates_with_ellipsis() {
+        assert_eq!(truncate_to_width("Analyze hermes-agent", 10), "Analyze h…");
+        assert_eq!(
+            display_width(&truncate_to_width("Analyze hermes-agent", 10)),
+            10
+        );
+    }
+
+    #[test]
+    fn truncate_to_width_zero_or_one_returns_empty() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+        assert_eq!(truncate_to_width("anything", 1), "");
+    }
+
+    #[test]
+    fn truncate_to_width_multibyte_no_panic() {
+        // Byte index 49 used to land inside a multi-byte sequence and panic.
+        // Should be safe now: truncate by display cells, not bytes.
+        let s = "查询".repeat(40); // each '查'/'询' is 2 display cells, 3 bytes
+        let out = truncate_to_width(&s, 10);
+        assert!(display_width(&out) <= 10);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_to_width_emoji_safe() {
+        // Emoji are typically 2 cells; truncation must not split surrogate halves
+        // and must not exceed the budget.
+        let out = truncate_to_width("🚧🚧🚧🚧🚧", 5);
+        assert!(display_width(&out) <= 5);
+        assert!(out.ends_with('…'));
     }
 }
 

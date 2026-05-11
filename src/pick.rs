@@ -100,10 +100,10 @@ pub fn run(sessions: &[Session]) -> Option<String> {
             } else if matches!(tier, AgeTier::Old | AgeTier::Exited) {
                 cmd_styles.push(BRIGHT_BLACK);
             }
-            if !matches!(tier, AgeTier::Old | AgeTier::Exited) {
-                if let Some(color) = status_color(s) {
-                    cmd_styles.push(color);
-                }
+            if !matches!(tier, AgeTier::Old | AgeTier::Exited)
+                && let Some(color) = status_color(s)
+            {
+                cmd_styles.push(color);
             }
             let cmd_display = paint(cmd, &cmd_styles);
             let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));

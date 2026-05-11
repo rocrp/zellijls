@@ -137,11 +137,12 @@ fn discover_runtime_roots() -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("contract_version_") && path.is_dir() && !roots.contains(&path)
-                {
-                    roots.push(path);
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("contract_version_")
+                && path.is_dir()
+                && !roots.contains(&path)
+            {
+                roots.push(path);
             }
         }
     }
@@ -204,7 +205,7 @@ impl SessionAge {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_connected_clients, SessionAge};
+    use super::{SessionAge, parse_connected_clients};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
