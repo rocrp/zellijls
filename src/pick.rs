@@ -6,7 +6,8 @@ use crossterm::execute;
 use crossterm::terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::{
-    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, RESET, Session, UNDERLINE, YELLOW,
+    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, GREY_BG, RESET, Session, UNDERLINE,
+    YELLOW,
     age::{AgeTier, age_tier, freshest_age_seconds},
     base_name, cmd_summary, display_width, paint, status_color,
 };
@@ -52,15 +53,28 @@ pub fn run(sessions: &[Session]) -> Option<String> {
         .ok();
 
         // Session list
+        let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
         for (list_idx, s) in sessions.iter().enumerate() {
             let tier = age_tier(s, freshest_age);
             let cmd = &cmd_texts[list_idx];
             let cmd_w = display_width(cmd);
-            let is_sel = list_idx == sel;
+            let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
+            let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
+            let age_text = if s.age.is_empty() {
+                String::new()
+            } else {
+                format!("{:<max_age$}", s.age)
+            };
 
-            let marker = if is_sel {
-                paint("\u{25b8}", &[GREEN])
-            } else if matches!(tier, AgeTier::Freshest) {
+            // Selected row: full-width grey highlight bar (plain text, no per-cell color).
+            if list_idx == sel {
+                let plain = format!(" \u{25b8} {}{name_pad}  {cmd}{cmd_pad}  {age_text}", s.name);
+                let pad = " ".repeat(cols.saturating_sub(display_width(&plain)));
+                write!(stdout, "{GREY_BG}{plain}{pad}{RESET}\r\n").ok();
+                continue;
+            }
+
+            let marker = if matches!(tier, AgeTier::Freshest) {
                 paint("\u{2022}", &[BRIGHT_CYAN])
             } else {
                 " ".into()
@@ -70,30 +84,24 @@ pub fn run(sessions: &[Session]) -> Option<String> {
             if s.is_exited {
                 name_styles.push(DIM);
             } else {
-                if is_sel {
-                    name_styles.push(BOLD);
-                }
                 if s.is_current {
                     name_styles.push(GREEN);
-                } else if !is_sel {
+                } else {
                     match tier {
                         AgeTier::Freshest => name_styles.push(BRIGHT_CYAN),
                         AgeTier::Recent => {}
                         AgeTier::Stale => name_styles.push(DIM),
                         AgeTier::Old | AgeTier::Exited => name_styles.push(BRIGHT_BLACK),
                     }
-                } else if matches!(tier, AgeTier::Freshest) {
-                    name_styles.push(BRIGHT_CYAN);
                 }
                 if s.connected_clients > 0 {
                     name_styles.push(UNDERLINE);
                 }
             }
             let name = paint(&s.name, &name_styles);
-            let name_pad = " ".repeat(max_name.saturating_sub(s.name.len()));
 
             let mut cmd_styles = Vec::new();
-            if is_sel || matches!(tier, AgeTier::Freshest) {
+            if matches!(tier, AgeTier::Freshest) {
                 cmd_styles.push(BOLD);
             } else if matches!(tier, AgeTier::Stale) {
                 cmd_styles.push(DIM);
@@ -106,12 +114,10 @@ pub fn run(sessions: &[Session]) -> Option<String> {
                 cmd_styles.push(color);
             }
             let cmd_display = paint(cmd, &cmd_styles);
-            let cmd_pad = " ".repeat(max_cmd.saturating_sub(cmd_w));
 
-            let age = if s.age.is_empty() {
+            let age = if age_text.is_empty() {
                 String::new()
             } else {
-                let age_text = format!("{:<max_age$}", s.age);
                 match tier {
                     AgeTier::Freshest => paint(&age_text, &[GREEN, BOLD]),
                     AgeTier::Recent => paint(&age_text, &[GREEN]),

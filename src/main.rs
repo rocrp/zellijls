@@ -23,6 +23,7 @@ pub(crate) const YELLOW: &str = "\x1b[33m";
 pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const BOLD: &str = "\x1b[1m";
+pub(crate) const GREY_BG: &str = "\x1b[100m";
 pub(crate) const UNDERLINE: &str = "\x1b[4m";
 pub(crate) const STRIKETHROUGH: &str = "\x1b[9m";
 
