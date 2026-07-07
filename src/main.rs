@@ -74,7 +74,7 @@ fn main() {
                 eprintln!("Failed to launch zellij: {err}");
                 std::process::exit(1);
             }
-            if let Some(name) = pick::run(&sessions) {
+            if let Some(name) = pick::run(sessions, build_sessions) {
                 use std::os::unix::process::CommandExt;
                 let err = std::process::Command::new("zellij")
                     .args(["attach", &name])
