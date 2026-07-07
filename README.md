@@ -60,8 +60,8 @@ zellijls --version
 
 ## How it works
 
-1. `zellij ls --no-formatting` → session list + age + exited state
-2. `zellij -s <name> action list-panes --all --json` → pane commands, CWDs, titles (sequential — zellij drops fields under concurrent queries)
+1. `session_info` + runtime dirs → session list + age + exited state
+2. `zellij -s <name> action list-panes --all --json` → pane commands, CWDs, titles (2-wide batches; corrupt concurrent responses are retried sequentially)
 3. `sysinfo` crate → find agent PIDs + CWDs (single in-process scan)
 4. `netstat2` crate → check established remote TCP connections per PID (single syscall)
 5. Match agent PIDs to sessions by CWD, render table

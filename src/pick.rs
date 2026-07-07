@@ -228,11 +228,7 @@ fn draw(stdout: &mut io::Stdout, state: &mut PickState) -> io::Result<()> {
         }
 
         if !sel_sess.task.is_empty() {
-            let state_text = match sel_sess.agent_state {
-                Some(AgentState::Working) => format!(" {BRIGHT_CYAN}working{RESET}"),
-                Some(AgentState::Waiting) => format!(" {YELLOW}waiting{RESET}"),
-                None => String::new(),
-            };
+            let state_text = colored_agent_state(sel_sess.agent_state);
             write!(
                 stdout,
                 " {DIM}task:{RESET} {}{state_text}\r\n",
@@ -247,11 +243,7 @@ fn draw(stdout: &mut io::Stdout, state: &mut PickState) -> io::Result<()> {
             let base = base_name(&pane.command);
             let cwd = pane.cwd.rsplit('/').next().unwrap_or(&pane.cwd);
             if is_agent_command(&pane.command) {
-                let state_text = match pane.agent_state {
-                    Some(AgentState::Working) => format!(" {BRIGHT_CYAN}working{RESET}"),
-                    Some(AgentState::Waiting) => format!(" {YELLOW}waiting{RESET}"),
-                    None => String::new(),
-                };
+                let state_text = colored_agent_state(pane.agent_state);
                 write!(
                     stdout,
                     " {DIM}pane:{RESET} {base}{state_text} {DIM}@ {cwd}{RESET}\r\n"
@@ -263,6 +255,14 @@ fn draw(stdout: &mut io::Stdout, state: &mut PickState) -> io::Result<()> {
     }
 
     stdout.flush()
+}
+
+fn colored_agent_state(state: Option<AgentState>) -> String {
+    match state {
+        Some(AgentState::Working) => format!(" {BRIGHT_CYAN}working{RESET}"),
+        Some(AgentState::Waiting) => format!(" {YELLOW}waiting{RESET}"),
+        None => String::new(),
+    }
 }
 
 fn prompt_for_action(state: &mut PickState, visible: &[usize], action: ConfirmAction) {

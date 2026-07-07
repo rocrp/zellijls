@@ -34,7 +34,18 @@ struct PaneQuery {
     corrupt: bool,
 }
 
-type AgentPidKey = (String, String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentPidKey {
+    cwd: String,
+    command_base: String,
+}
+
+impl AgentPidKey {
+    fn new(cwd: String, command_base: String) -> Self {
+        Self { cwd, command_base }
+    }
+}
+
 type AgentPidMap = HashMap<AgentPidKey, Vec<u32>>;
 
 /// Run a subprocess with a hard wall-clock timeout. Returns None if the
@@ -154,7 +165,10 @@ fn agent_pid_key(process: &sysinfo::Process) -> Option<AgentPidKey> {
         return None;
     }
     let cwd = process.cwd()?;
-    Some((cwd.to_string_lossy().into_owned(), base.to_string()))
+    Some(AgentPidKey::new(
+        cwd.to_string_lossy().into_owned(),
+        base.to_string(),
+    ))
 }
 
 fn build_agent_pid_map(sys: &System) -> AgentPidMap {
@@ -217,7 +231,7 @@ fn pane_agent_state(
         return AgentState::Working;
     }
 
-    let key = (pane.cwd.clone(), base_name(&pane.command).to_string());
+    let key = AgentPidKey::new(pane.cwd.clone(), base_name(&pane.command).to_string());
     if let Some(pids) = agent_pid_map.get(&key) {
         if pids.iter().any(|p| working_pids.contains(p)) {
             AgentState::Working
