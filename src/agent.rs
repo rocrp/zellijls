@@ -4,7 +4,9 @@ const IDLE_SHELLS: &[&str] = &["zsh", "bash", "sh", "fish"];
 
 pub(crate) fn base_name(cmd: &str) -> &str {
     let binary = cmd.split_whitespace().next().unwrap_or("");
-    binary.rsplit('/').next().unwrap_or(binary)
+    let binary = binary.rsplit('/').next().unwrap_or(binary);
+    // Login shells report argv[0] as "-zsh".
+    binary.strip_prefix('-').unwrap_or(binary)
 }
 
 pub(crate) fn is_agent_base(base: &str) -> bool {
@@ -76,6 +78,17 @@ mod tests {
             title: title.to_string(),
             agent_state: None,
         }
+    }
+
+    #[test]
+    fn base_name_strips_path_args_and_login_dash() {
+        assert_eq!(base_name("/bin/zsh"), "zsh");
+        assert_eq!(base_name("-zsh"), "zsh");
+        assert_eq!(base_name("claude --continue"), "claude");
+        assert_eq!(
+            base_name("/Applications/Xcode.app/Contents/Developer/usr/bin/make beta"),
+            "make"
+        );
     }
 
     #[test]

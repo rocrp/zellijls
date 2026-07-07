@@ -61,23 +61,105 @@ pub(crate) fn list_sessions() -> Vec<SessionEntry> {
     out
 }
 
-pub(crate) fn connected_clients(session_name: &str) -> u32 {
-    let Some(dir) = session_info_dir(session_name) else {
-        return 0;
-    };
-    let Ok(text) = fs::read_to_string(dir.join("session-metadata.kdl")) else {
-        return 0;
-    };
-    parse_connected_clients(&text)
+/// Raw text of a session's metadata KDL. One read serves every extractor
+/// (`parse_connected_clients`, `parse_panes`).
+pub(crate) fn read_metadata(session_name: &str) -> Option<String> {
+    let dir = session_info_dir(session_name)?;
+    fs::read_to_string(dir.join("session-metadata.kdl")).ok()
 }
 
-fn parse_connected_clients(text: &str) -> u32 {
+pub(crate) fn parse_connected_clients(text: &str) -> u32 {
     for line in text.lines() {
         if let Some(rest) = line.trim_start().strip_prefix("connected_clients ") {
             return rest.trim().parse().unwrap_or(0);
         }
     }
     0
+}
+
+/// One pane record from the metadata KDL `panes { }` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetaPane {
+    pub id: u64,
+    pub title: String,
+    pub is_plugin: bool,
+    pub exited: bool,
+}
+
+/// Extract pane records from the top-level `panes { }` block, line-based
+/// like `parse_connected_clients` — the four fields we need don't justify
+/// a KDL parser dependency.
+pub(crate) fn parse_panes(text: &str) -> Vec<MetaPane> {
+    let mut out = Vec::new();
+    let mut in_panes = false;
+    let mut depth = 0u32;
+    let mut current: Option<MetaPane> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_panes {
+            if trimmed == "panes {" && !line.starts_with(char::is_whitespace) {
+                in_panes = true;
+                depth = 1;
+            }
+            continue;
+        }
+
+        if trimmed == "pane {" {
+            depth += 1;
+            current = Some(MetaPane {
+                id: 0,
+                title: String::new(),
+                is_plugin: false,
+                exited: false,
+            });
+        } else if trimmed == "}" {
+            depth -= 1;
+            match depth {
+                1 => out.extend(current.take()),
+                0 => break,
+                _ => {}
+            }
+        } else if let Some(pane) = current.as_mut() {
+            if let Some(v) = trimmed.strip_prefix("id ") {
+                pane.id = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = trimmed.strip_prefix("is_plugin ") {
+                pane.is_plugin = v.trim() == "true";
+            } else if let Some(v) = trimmed.strip_prefix("exited ") {
+                pane.exited = v.trim() == "true";
+            } else if let Some(v) = trimmed.strip_prefix("title ") {
+                pane.title = unquote_kdl(v.trim());
+            }
+        }
+    }
+    out
+}
+
+/// Strip surrounding quotes and undo the common KDL string escapes.
+fn unquote_kdl(v: &str) -> String {
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(v);
+    if !inner.contains('\\') {
+        return inner.to_string();
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
 }
 
 fn session_info_dir(session_name: &str) -> Option<PathBuf> {
@@ -205,8 +287,78 @@ impl SessionAge {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionAge, parse_connected_clients};
+    use super::{MetaPane, SessionAge, parse_connected_clients, parse_panes};
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn parses_panes_block() {
+        let text = r#"name "voii"
+tabs {
+    tab {
+        position 0
+        name "Tab #1"
+    }
+}
+panes {
+    pane {
+        id 0
+        is_plugin false
+        title "✳ Debug push notification certificate issue"
+        exited false
+        tab_position 0
+    }
+    pane {
+        id 0
+        is_plugin true
+        title "tab-bar"
+        exited false
+    }
+    pane {
+        id 4
+        is_plugin false
+        title "say \"hi\" \\ done"
+        exited true
+    }
+}
+connected_clients 1
+pane_history {
+    client {
+        id 1
+        history {
+            pane_id type="terminal" 0
+        }
+    }
+}
+"#;
+        assert_eq!(
+            parse_panes(text),
+            vec![
+                MetaPane {
+                    id: 0,
+                    title: "✳ Debug push notification certificate issue".into(),
+                    is_plugin: false,
+                    exited: false,
+                },
+                MetaPane {
+                    id: 0,
+                    title: "tab-bar".into(),
+                    is_plugin: true,
+                    exited: false,
+                },
+                MetaPane {
+                    id: 4,
+                    title: "say \"hi\" \\ done".into(),
+                    is_plugin: false,
+                    exited: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_panes_without_block_is_empty() {
+        assert!(parse_panes("name \"x\"\nconnected_clients 0\n").is_empty());
+    }
 
     #[test]
     fn parses_connected_clients_from_metadata() {

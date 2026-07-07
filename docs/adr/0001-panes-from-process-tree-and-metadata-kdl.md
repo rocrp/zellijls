@@ -1,0 +1,10 @@
+# Panes come from the process tree + metadata KDL, never from a zellij subprocess
+
+zellij 0.44.3's `action list-panes` drops `pane_command` from ~50% of responses under concurrent queries (issue #1) and costs ~450ms of the ~0.65s runtime. We replace it entirely: pane commands, cwds, and agent PIDs come from the Server's process subtree; pane titles come from `session-metadata.kdl`. This removes the last subprocess (and with it `run_cmd`, the timeout thread, the corrupt-retry pass, and the 2-wide query batching) and drops typical runtime to ~0.2s, bounded by the 100ms CPU sample.
+
+Key mechanics, verified live on zellij 0.44.3 (2026-07-07):
+
+- **Pane Command = foreground process group leader on the pane's tty.** The Server's direct children are Pane Shells (`zsh`), not the commands; `list-panes` reports the *foreground job* (`claude`, `make beta`), so parity requires resolving the shell's `tpgid` (macOS: `proc_pidinfo` `e_tpgid`, same syscall tty-age already makes; Linux: `/proc/<pid>/stat` field 8) and matching it to a process's pgid. Rejected: "deepest/newest descendant" — stray processes idle on pane ttys (observed: Codex.app MCP servers) and backgrounded jobs would win incorrectly.
+- **Title↔process binding is Creation-Order Binding.** KDL terminal pane ids and Pane Shell start times are both monotonically creation-ordered; sort each, zip. On count mismatch (pane closing mid-read, held pane), degrade to session-level association: any Spinner Title marks the session Working, first noise-filtered title is the Task. Rejected as primary: title heuristics alone — cannot disambiguate multi-agent sessions that positional binding handles exactly.
+- **No full KDL parser.** Titles/ids/plugin flags are extracted line-based from the `panes { }` block, like the existing `connected_clients` parse. The metadata schema is stable enough per contract_version dir, and a parser dependency is not worth it for four fields.
+- **Linux is included, best-effort.** Children enumeration (sysinfo) and metadata KDL (`~/.cache/zellij`) are portable; only the per-pid probe (tty dev, tpgid, start time) is per-OS. Untested on real hardware.

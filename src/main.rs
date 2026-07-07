@@ -5,9 +5,8 @@ mod display;
 mod json_output;
 mod model;
 mod pick;
+mod procs;
 mod session_info;
-#[cfg(target_os = "macos")]
-mod tty_age;
 mod watch;
 
 use collect::build_sessions;

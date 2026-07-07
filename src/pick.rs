@@ -94,10 +94,10 @@ fn run_zellij_action(action: ConfirmAction, session_name: &str) -> io::Result<()
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("zellij {} exited with {status}", action.command()),
-        ))
+        Err(io::Error::other(format!(
+            "zellij {} exited with {status}",
+            action.command()
+        )))
     }
 }
 

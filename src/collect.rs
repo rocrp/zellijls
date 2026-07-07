@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, TcpState};
-use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::age::{format_age, sort_sessions_for_display};
 use crate::agent::{base_name, is_agent_base, is_agent_command, is_spinner, task_from_agent_pane};
 use crate::model::{AgentState, Pane, Session};
-use crate::session_info::{connected_clients, list_sessions};
+use crate::procs::{self, PaneSource};
+use crate::session_info::{
+    MetaPane, list_sessions, parse_connected_clients, parse_panes, read_metadata,
+};
 
 #[derive(Debug)]
 struct SessionMeta {
@@ -17,72 +19,6 @@ struct SessionMeta {
     age_seconds: u64,
     is_current: bool,
     is_exited: bool,
-}
-
-#[derive(Deserialize)]
-struct ZellijPane {
-    is_plugin: Option<bool>,
-    pane_command: Option<String>,
-    terminal_command: Option<String>,
-    pane_cwd: Option<String>,
-    title: Option<String>,
-}
-
-#[derive(Debug)]
-struct PaneQuery {
-    panes: Vec<Pane>,
-    corrupt: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AgentPidKey {
-    cwd: String,
-    command_base: String,
-}
-
-impl AgentPidKey {
-    fn new(cwd: String, command_base: String) -> Self {
-        Self { cwd, command_base }
-    }
-}
-
-type AgentPidMap = HashMap<AgentPidKey, Vec<u32>>;
-
-/// Run a subprocess with a hard wall-clock timeout. Returns None if the
-/// process fails, exits non-zero, or is killed for exceeding `timeout` (e.g.
-/// a wedged zellij server). Robustness matters here: without a timeout a
-/// single stuck session server would hang the whole CLI indefinitely.
-fn run_cmd(cmd: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let result = match rx.recv_timeout(timeout) {
-        Ok(buf) => Some(buf),
-        Err(_) => {
-            let _ = child.kill();
-            None
-        }
-    };
-    let _ = child.wait();
-    let _ = reader.join();
-
-    let buf = result?;
-    Some(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
 fn get_session_list() -> Vec<SessionMeta> {
@@ -102,99 +38,74 @@ fn get_session_list() -> Vec<SessionMeta> {
         .collect()
 }
 
-fn get_panes(session: &str) -> PaneQuery {
-    // Normal queries finish in ~50-100ms; anything past 1s is a wedged
-    // session server and we'd rather degrade to "empty" than hang the CLI.
-    let Some(json_str) = run_cmd(
-        "zellij",
-        &["-s", session, "action", "list-panes", "--all", "--json"],
-        std::time::Duration::from_secs(1),
-    ) else {
-        return PaneQuery {
-            panes: Vec::new(),
-            corrupt: false,
-        };
-    };
-    let Ok(panes) = serde_json::from_str::<Vec<ZellijPane>>(&json_str) else {
-        return PaneQuery {
-            panes: Vec::new(),
-            corrupt: false,
-        };
-    };
+/// Bind metadata-KDL titles to pane sources (Creation-Order Binding).
+///
+/// `kdl` must be terminal (non-plugin), non-exited panes sorted by id;
+/// `source_is_agent` flags each pane source in creation order. When the
+/// counts match, pane ids and process start times share creation order, so
+/// a positional zip is exact. On mismatch (pane closing mid-read) degrade
+/// to agent-only association: spinner/✳-prefixed titles are agent-set, so
+/// hand them out to agent panes in order and leave the rest untitled —
+/// non-agent titles are never rendered anyway.
+fn bind_titles(kdl: &[MetaPane], source_is_agent: &[bool]) -> Vec<String> {
+    if kdl.len() == source_is_agent.len() {
+        return kdl.iter().map(|p| p.title.clone()).collect();
+    }
 
-    let corrupt = panes.iter().any(|p| {
-        !p.is_plugin.unwrap_or(false) && p.pane_command.is_none() && p.terminal_command.is_none()
-    });
-    let panes = panes
-        .into_iter()
-        .filter(|p| !p.is_plugin.unwrap_or(false))
-        .map(|p| Pane {
-            command: p.pane_command.or(p.terminal_command).unwrap_or_default(),
-            cwd: p.pane_cwd.unwrap_or_default(),
-            title: p.title.unwrap_or_default(),
-            agent_state: None,
+    let mut agent_titles = kdl
+        .iter()
+        .filter(|p| p.title.starts_with(|c: char| is_spinner(c) || c == '✳'));
+    source_is_agent
+        .iter()
+        .map(|&is_agent| {
+            if is_agent {
+                agent_titles
+                    .next()
+                    .map(|p| p.title.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
         })
+        .collect()
+}
+
+/// Terminal, live panes from the metadata KDL in creation (id) order.
+fn terminal_panes(metadata: Option<&String>) -> Vec<MetaPane> {
+    let mut panes: Vec<MetaPane> = metadata
+        .map(|text| parse_panes(text))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.is_plugin && !p.exited)
         .collect();
-
-    PaneQuery { panes, corrupt }
+    panes.sort_by_key(|p| p.id);
+    panes
 }
 
-fn query_session(session: &SessionMeta) -> (u32, PaneQuery) {
-    if session.is_exited {
-        return (
-            0,
-            PaneQuery {
-                panes: Vec::new(),
-                corrupt: false,
-            },
-        );
+fn command_string(process: &sysinfo::Process) -> String {
+    let cmd = process.cmd();
+    if cmd.is_empty() {
+        process.name().to_string_lossy().into_owned()
+    } else {
+        cmd.iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
-
-    (connected_clients(&session.name), get_panes(&session.name))
-}
-
-fn is_agent_process(process: &sysinfo::Process) -> bool {
-    let name = process.name().to_string_lossy();
-    is_agent_base(base_name(&name))
-}
-
-fn agent_pid_key(process: &sysinfo::Process) -> Option<AgentPidKey> {
-    let name = process.name().to_string_lossy();
-    let base = base_name(&name);
-    if !is_agent_base(base) {
-        return None;
-    }
-    let cwd = process.cwd()?;
-    Some(AgentPidKey::new(
-        cwd.to_string_lossy().into_owned(),
-        base.to_string(),
-    ))
-}
-
-fn build_agent_pid_map(sys: &System) -> AgentPidMap {
-    let mut map: AgentPidMap = HashMap::new();
-    for process in sys.processes().values() {
-        let Some(key) = agent_pid_key(process) else {
-            continue;
-        };
-        map.entry(key).or_default().push(process.pid().as_u32());
-    }
-    map
 }
 
 fn build_working_pids(
     sys: &System,
-    agent_pids: &AgentPidMap,
+    agent_pids: &HashSet<u32>,
     sockets: &[SocketInfo],
 ) -> HashSet<u32> {
-    let all_pids: HashSet<u32> = agent_pids.values().flatten().copied().collect();
-    if all_pids.is_empty() {
+    if agent_pids.is_empty() {
         return HashSet::new();
     }
 
     let mut working = HashSet::new();
 
-    for &pid in &all_pids {
+    for &pid in agent_pids {
         if let Some(process) = sys.process(Pid::from_u32(pid))
             && process.cpu_usage() > 3.0
         {
@@ -210,7 +121,7 @@ fn build_working_pids(
             continue;
         }
         for &pid in &si.associated_pids {
-            if all_pids.contains(&pid)
+            if agent_pids.contains(&pid)
                 && !working.contains(&pid)
                 && let Some(process) = sys.process(Pid::from_u32(pid))
                 && process.cpu_usage() > 0.5
@@ -222,36 +133,21 @@ fn build_working_pids(
     working
 }
 
-fn pane_agent_state(
-    pane: &Pane,
-    agent_pid_map: &AgentPidMap,
-    working_pids: &HashSet<u32>,
-) -> AgentState {
-    if pane.title.starts_with(is_spinner) {
-        return AgentState::Working;
-    }
-
-    let key = AgentPidKey::new(pane.cwd.clone(), base_name(&pane.command).to_string());
-    if let Some(pids) = agent_pid_map.get(&key) {
-        if pids.iter().any(|p| working_pids.contains(p)) {
-            AgentState::Working
-        } else {
-            AgentState::Waiting
-        }
-    } else {
-        AgentState::Waiting
-    }
-}
-
 fn update_agent_states(
     sessions: &mut [Session],
-    agent_pid_map: &AgentPidMap,
+    fg_pids: &[Vec<u32>],
     working_pids: &HashSet<u32>,
 ) {
-    for session in sessions {
-        for pane in &mut session.panes {
+    for (session, pids) in sessions.iter_mut().zip(fg_pids) {
+        for (pane, &fg_pid) in session.panes.iter_mut().zip(pids) {
             if is_agent_command(&pane.command) {
-                pane.agent_state = Some(pane_agent_state(pane, agent_pid_map, working_pids));
+                pane.agent_state = Some(
+                    if pane.title.starts_with(is_spinner) || working_pids.contains(&fg_pid) {
+                        AgentState::Working
+                    } else {
+                        AgentState::Waiting
+                    },
+                );
             }
         }
 
@@ -277,15 +173,10 @@ pub(crate) fn build_sessions() -> Vec<Session> {
 
     let cpu_sample_start = Instant::now();
 
-    // Everything below runs concurrently:
-    //  - Phase A: broad sysinfo refresh (CPU only; cwd is expensive on macOS
-    //    and we only need it for agent PIDs, refreshed later in Phase B).
-    //  - TCP socket table scan for detecting network-active agents.
-    //  - Pane queries per session. zellij 0.44.3 can drop `pane_command` from
-    //    non-plugin panes when list-panes calls overlap, so the fast path keeps
-    //    2-wide batches and then strictly re-queries corrupt responses.
-    const PANE_QUERY_CONCURRENCY: usize = 2;
-    let (mut sys, sockets, mut pane_data) = std::thread::scope(|s| {
+    // Phase A: broad sysinfo refresh (CPU sample start; names come along
+    // for free) concurrent with the TCP socket table scan used to detect
+    // network-active agents. No subprocesses anywhere — see ADR-0001.
+    let (mut sys, sockets) = std::thread::scope(|s| {
         let sys_h = s.spawn(|| {
             let mut sys = System::new();
             sys.refresh_processes_specifics(
@@ -302,62 +193,108 @@ pub(crate) fn build_sessions() -> Vec<Session> {
             )
             .unwrap_or_default()
         });
-        let pane_h = s.spawn(|| {
-            let mut out: Vec<(u32, PaneQuery)> = Vec::with_capacity(meta.len());
-            std::thread::scope(|ps| {
-                for batch in meta.chunks(PANE_QUERY_CONCURRENCY) {
-                    let handles: Vec<_> = batch
-                        .iter()
-                        .map(|m| ps.spawn(move || query_session(m)))
-                        .collect();
-                    for h in handles {
-                        out.push(h.join().unwrap());
-                    }
-                }
-            });
-            out
-        });
-        (
-            sys_h.join().unwrap(),
-            sock_h.join().unwrap(),
-            pane_h.join().unwrap(),
-        )
+        (sys_h.join().unwrap(), sock_h.join().unwrap())
     });
 
-    for (session, (_, query)) in meta.iter().zip(&mut pane_data) {
-        if !session.is_exited && query.corrupt {
-            *query = get_panes(&session.name);
-        }
-    }
-
-    // Agent PIDs identified by process name alone; cwd gets populated in Phase B.
-    let agent_pids: Vec<Pid> = sys
-        .processes()
-        .values()
-        .filter(|p| is_agent_process(p))
-        .map(|p| p.pid())
+    // Metadata KDL per live session: connected clients + pane titles from
+    // one read each.
+    let metadata: Vec<Option<String>> = meta
+        .iter()
+        .map(|m| {
+            if m.is_exited {
+                None
+            } else {
+                read_metadata(&m.name)
+            }
+        })
         .collect();
 
-    // Zellij PIDs (any role: server/client/etc.) — cmd line gets populated
-    // in Phase B so we can pick out the `--server` ones and map them back
-    // to session names for TTY-mtime activity probing.
-    #[cfg(target_os = "macos")]
+    // Zellij PIDs → targeted cmd refresh (cheap: single sysctl per PID,
+    // ~5-10 PIDs typical) → session name → server pid → pane sources.
     let zellij_pids: Vec<Pid> = sys
         .processes()
         .values()
-        .filter(|p| {
-            let name = p.name().to_string_lossy();
-            base_name(&name) == "zellij"
-        })
+        .filter(|p| base_name(&p.name().to_string_lossy()) == "zellij")
         .map(|p| p.pid())
         .collect();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&zellij_pids),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let server_by_session = procs::discover_servers(&sys, &zellij_pids);
+    let server_pids: HashSet<u32> = server_by_session.values().copied().collect();
+    let children = procs::children_by_server(&sys, &server_pids);
 
+    let sources: Vec<Vec<PaneSource>> = meta
+        .iter()
+        .map(|m| {
+            server_by_session
+                .get(&m.name)
+                .and_then(|pid| children.get(pid))
+                .map(|kids| procs::pane_sources(&sys, kids))
+                .unwrap_or_default()
+        })
+        .collect();
+
+    // Ensure >= 100ms between CPU samples for sysinfo delta accuracy.
+    let min_delay = std::time::Duration::from_millis(100);
+    let elapsed = cpu_sample_start.elapsed();
+    if elapsed < min_delay {
+        std::thread::sleep(min_delay - elapsed);
+    }
+
+    // Phase B: targeted refresh of the foreground pids — CPU delta for
+    // working detection, cwd + full cmd for the pane rows.
+    let fg_pids: Vec<Pid> = sources
+        .iter()
+        .flatten()
+        .map(|s| Pid::from_u32(s.fg_pid))
+        .collect();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&fg_pids),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_cwd(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always),
+    );
+
+    let mut fg_by_session: Vec<Vec<u32>> = Vec::with_capacity(meta.len());
     let mut sessions: Vec<Session> = meta
         .iter()
-        .zip(pane_data)
-        .map(|(m, (clients, query))| {
-            let task = query
-                .panes
+        .zip(&metadata)
+        .zip(&sources)
+        .map(|((m, metadata), sources)| {
+            let panes: Vec<Pane> = {
+                let is_agent: Vec<bool> = sources
+                    .iter()
+                    .map(|s| {
+                        sys.process(Pid::from_u32(s.fg_pid))
+                            .is_some_and(|p| is_agent_base(base_name(&p.name().to_string_lossy())))
+                    })
+                    .collect();
+                let titles = bind_titles(&terminal_panes(metadata.as_ref()), &is_agent);
+                sources
+                    .iter()
+                    .zip(titles)
+                    .map(|(source, title)| {
+                        let process = sys.process(Pid::from_u32(source.fg_pid));
+                        Pane {
+                            command: process.map(command_string).unwrap_or_default(),
+                            cwd: process
+                                .and_then(|p| p.cwd())
+                                .map(|c| c.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            title,
+                            agent_state: None,
+                        }
+                    })
+                    .collect()
+            };
+            fg_by_session.push(sources.iter().map(|s| s.fg_pid).collect());
+
+            let task = panes
                 .iter()
                 .filter(|p| is_agent_command(&p.command))
                 .find_map(|p| task_from_agent_pane(p, &m.name))
@@ -368,63 +305,104 @@ pub(crate) fn build_sessions() -> Vec<Session> {
                 age_seconds: m.age_seconds,
                 is_current: m.is_current,
                 is_exited: m.is_exited,
-                connected_clients: clients,
-                panes: query.panes,
+                connected_clients: metadata
+                    .as_ref()
+                    .map(|text| parse_connected_clients(text))
+                    .unwrap_or(0),
+                panes,
                 agent_state: None,
                 task,
             }
         })
         .collect();
 
-    // Ensure >= 100ms between CPU samples for sysinfo delta accuracy. Pane
-    // queries normally cover this on their own; we only sleep the shortfall.
-    let min_delay = std::time::Duration::from_millis(100);
-    let elapsed = cpu_sample_start.elapsed();
-    if elapsed < min_delay {
-        std::thread::sleep(min_delay - elapsed);
-    }
-
-    // Phase B: targeted refresh — only agent PIDs, this time with cwd.
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&agent_pids),
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cpu()
-            .with_cwd(UpdateKind::Always),
-    );
-
-    // Targeted refresh for zellij PIDs to pull `cmd` (cheap on macOS:
-    // single sysctl per PID, ~5-10 PIDs typical). Then derive per-session
-    // last-activity timestamps from PTY slave mtime and overwrite the
-    // metadata-mtime age, which is uselessly fresh for live sessions
-    // because zellij rewrites the metadata on every tick.
-    #[cfg(target_os = "macos")]
+    // Last-activity per session from PTY slave mtime: the kernel touches
+    // the slave on pane I/O, unlike the metadata KDL whose mtime is
+    // uselessly fresh (rewritten every zellij tick).
     {
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&zellij_pids),
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-        let server_by_session = crate::tty_age::discover_servers(&sys, &zellij_pids);
-        let activity = crate::tty_age::last_activity_per_session(&sys, &server_by_session);
+        let mut tty_mtime_cache: HashMap<u32, Option<SystemTime>> = HashMap::new();
         let now = SystemTime::now();
-        for session in &mut sessions {
-            if session.is_exited {
-                continue;
+        for (session, sources) in sessions.iter_mut().zip(&sources) {
+            let latest = sources
+                .iter()
+                .filter_map(|s| {
+                    *tty_mtime_cache
+                        .entry(s.tty_dev)
+                        .or_insert_with(|| procs::tty_mtime(s.tty_dev))
+                })
+                .max();
+            if let Some(mtime) = latest {
+                let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
+                session.age_seconds = secs;
+                session.age = format_age(secs);
             }
-            let Some(mtime) = activity.get(&session.name) else {
-                continue;
-            };
-            let secs = now.duration_since(*mtime).unwrap_or_default().as_secs();
-            session.age_seconds = secs;
-            session.age = format_age(secs);
         }
     }
 
-    let agent_pid_map = build_agent_pid_map(&sys);
-    let working_pids = build_working_pids(&sys, &agent_pid_map, &sockets);
-    update_agent_states(&mut sessions, &agent_pid_map, &working_pids);
+    let agent_pids: HashSet<u32> = sessions
+        .iter()
+        .zip(&fg_by_session)
+        .flat_map(|(session, pids)| {
+            session
+                .panes
+                .iter()
+                .zip(pids)
+                .filter(|(pane, _)| is_agent_command(&pane.command))
+                .map(|(_, &pid)| pid)
+        })
+        .collect();
+    let working_pids = build_working_pids(&sys, &agent_pids, &sockets);
+    update_agent_states(&mut sessions, &fg_by_session, &working_pids);
 
     sort_sessions_for_display(&mut sessions);
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta_pane(id: u64, title: &str) -> MetaPane {
+        MetaPane {
+            id,
+            title: title.into(),
+            is_plugin: false,
+            exited: false,
+        }
+    }
+
+    #[test]
+    fn bind_titles_zips_when_counts_match() {
+        let kdl = [
+            meta_pane(0, "✳ Fix the bug"),
+            meta_pane(1, "voii"),
+            meta_pane(4, "make beta"),
+        ];
+        assert_eq!(
+            bind_titles(&kdl, &[true, true, false]),
+            vec!["✳ Fix the bug", "voii", "make beta"]
+        );
+    }
+
+    #[test]
+    fn bind_titles_falls_back_to_agent_only_on_mismatch() {
+        // One pane closed between the KDL read and the process scan: three
+        // titles, two processes. Spinner titles go to agent panes in order;
+        // the shell pane stays untitled.
+        let kdl = [
+            meta_pane(0, "⠐ Refactor collect"),
+            meta_pane(1, "~/w/rccc"),
+            meta_pane(2, "✳ Write tests"),
+        ];
+        assert_eq!(
+            bind_titles(&kdl, &[false, true]),
+            vec!["", "⠐ Refactor collect"]
+        );
+    }
+
+    #[test]
+    fn bind_titles_mismatch_without_agents_yields_untitled() {
+        let kdl = [meta_pane(0, "~/Downloads")];
+        assert_eq!(bind_titles(&kdl, &[false, false]), vec!["", ""]);
+    }
 }

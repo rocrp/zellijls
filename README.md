@@ -19,7 +19,7 @@ hntui    exited          4h
 - **Task extraction**: reads pane title set by Claude Code (spinner prefix stripped)
 - **Attached sessions**: session name is underlined when a client is currently attached (read from zellij's `session-metadata.kdl`)
 - **JSON output**: `zellijls --json` emits script-friendly session data without ANSI
-- **Fast**: process inspection via `sysinfo` + `netstat2` (no `lsof`/`ps` subprocess calls)
+- **Fast**: everything from disk state + the process tree — zero subprocess spawns, ~0.15s
 
 ## Install
 
@@ -61,7 +61,9 @@ zellijls --version
 ## How it works
 
 1. `session_info` + runtime dirs → session list + age + exited state
-2. `zellij -s <name> action list-panes --all --json` → pane commands, CWDs, titles (2-wide batches; corrupt concurrent responses are retried sequentially)
-3. `sysinfo` crate → find agent PIDs + CWDs (single in-process scan)
-4. `netstat2` crate → check established remote TCP connections per PID (single syscall)
-5. Match agent PIDs to sessions by CWD, render table
+2. `session-metadata.kdl` → connected clients + pane titles (ids are creation-ordered)
+3. Process tree → each session's `zellij --server` children are the pane shells; one probe per shell (macOS `proc_pidinfo`, Linux `/proc/<pid>/stat`) yields tty (age from PTY slave mtime), foreground process group (the pane command + cwd, via `sysinfo`), and start time (creation order, for binding KDL titles to panes)
+4. `netstat2` crate → check established remote TCP connections per agent PID (single syscall)
+5. Render table
+
+No zellij subprocess is ever spawned (see `docs/adr/0001`), which also sidesteps zellij 0.44.3 dropping `pane_command` under concurrent `list-panes` queries.
