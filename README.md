@@ -18,6 +18,7 @@ hntui    exited          4h
 - **Working/waiting**: checks TCP connections via `netstat2` — active API call = working, no connection = waiting
 - **Task extraction**: reads pane title set by Claude Code (spinner prefix stripped)
 - **Attached sessions**: session name is underlined when a client is currently attached (read from zellij's `session-metadata.kdl`)
+- **JSON output**: `zellijls --json` emits script-friendly session data without ANSI
 - **Fast**: process inspection via `sysinfo` + `netstat2` (no `lsof`/`ps` subprocess calls)
 
 ## Install
@@ -39,6 +40,23 @@ From source:
 ```sh
 cargo install --path .
 ```
+
+## Usage
+
+```sh
+zellijls              # table
+zellijls pick         # choose and attach
+zellijls watch        # auto-refreshing dashboard
+zellijls --json       # machine-readable array
+zellijls --help
+zellijls --version
+```
+
+`--json` fields:
+
+- session: `name`, `exited`, `current`, `attached`, `age_seconds`, `age`, `status`, `agent_state`, `task`, `panes`
+- pane: `command`, `cwd`, `agent`, optional `state`
+- states: `"working"`, `"waiting"`, or `null`
 
 ## How it works
 
