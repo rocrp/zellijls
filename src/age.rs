@@ -1,4 +1,4 @@
-use crate::Session;
+use crate::model::Session;
 
 const RECENT_AGE_LIMIT_SECS: u64 = 6 * 60 * 60;
 const STALE_AGE_LIMIT_SECS: u64 = 24 * 60 * 60;
@@ -55,13 +55,13 @@ pub(crate) fn age_tier(session: &Session, freshest_age: Option<u64>) -> AgeTier 
 }
 
 pub(crate) fn sort_sessions_for_display(sessions: &mut [Session]) {
-    sessions.sort_by_key(|s| !s.is_current);
+    sessions.sort_by_key(|s| (!s.is_current, s.is_exited, s.age_seconds));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AgeTier, age_tier, format_age, freshest_age_seconds, sort_sessions_for_display};
-    use crate::{Pane, Session};
+    use crate::model::{Pane, Session};
 
     fn session(name: &str, age_seconds: u64, is_current: bool, is_exited: bool) -> Session {
         Session {
@@ -127,16 +127,27 @@ mod tests {
     }
 
     #[test]
-    fn pins_current_session_without_reordering_the_rest() {
+    fn sorts_current_then_live_by_recency_then_exited() {
         let mut sessions = vec![
-            session("older", 10_000, false, false),
+            session("exited-new", 10, false, true),
+            session("older-live", 10_000, false, false),
             session("current", 1_000, true, false),
-            session("newest", 100, false, false),
+            session("newer-live", 100, false, false),
+            session("exited-old", 50_000, false, true),
         ];
 
         sort_sessions_for_display(&mut sessions);
 
         let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["current", "older", "newest"]);
+        assert_eq!(
+            names,
+            vec![
+                "current",
+                "newer-live",
+                "older-live",
+                "exited-new",
+                "exited-old"
+            ]
+        );
     }
 }

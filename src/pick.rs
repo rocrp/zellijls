@@ -6,10 +6,13 @@ use crossterm::execute;
 use crossterm::terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::{
-    AgentState, BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, GREY_BG, RESET, Session, UNDERLINE,
-    YELLOW,
     age::{AgeTier, age_tier, freshest_age_seconds},
-    base_name, cmd_summary, display_width, paint, status_color,
+    agent::base_name,
+    display::{
+        BOLD, BRIGHT_BLACK, BRIGHT_CYAN, DIM, GREEN, GREY_BG, RESET, UNDERLINE, YELLOW,
+        cmd_summary, display_width, paint, status_color,
+    },
+    model::{AgentState, Session},
 };
 
 pub fn run(sessions: &[Session]) -> Option<String> {
